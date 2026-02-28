@@ -4,6 +4,7 @@
 #include "gps.h"
 #include "usart_debug.h"
 #include "delay.h"
+#include "tcp_client.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -27,6 +28,8 @@ int main(void)
 {
     uint8_t rx_buf[1024];
     uint8_t connected = 0;
+    int client_fd = -1;
+    char* str;
 
     static uint32_t last_periodic_gps = 0; 
     // uint32_t last_gps_print = 0;
@@ -49,6 +52,7 @@ int main(void)
 
     W5500_SetNetwork(mac, ip, sn, gw);
     W5500_TCP_Server_Init(0, 5000);
+    client_fd = tcp_connect("192.169.0.125", 500);
 
     usart_debug("TCP SERVER LISTENING...\r\n");
 
@@ -101,6 +105,26 @@ int main(void)
                     lon, gps_data.ew,
                     spd
                 );
+
+                str = snprintf (
+                    "\r\n[GPS DATA]\r\n"
+                    "DATE : %02d/%02d/%04d\r\n"
+                    "TIME : %02d:%02d:%02d\r\n"
+                    "LAT  : %.6f %c\r\n"
+                    "LON  : %.6f %c\r\n"
+                    "SPD  : %.2f km/h\r\n",
+                    gps_data.day,
+                    gps_data.month,
+                    gps_data.year,
+                    gps_data.hour,
+                    gps_data.minute,
+                    gps_data.second,
+                    lat, gps_data.ns,
+                    lon, gps_data.ew,
+                    spd
+                );
+
+                tcp_send(client_fd, str, strlen(str));
             }
 
             /* ===== EVENT → GPS SNAPSHOT ===== */
