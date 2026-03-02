@@ -19,6 +19,10 @@ from datetime import datetime, timedelta
 # MQTT_HOST = "192.168.0.125"
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
+MQTT_TOPIC_ACCL = "adj/datalogger/sensors/accelerometer"
+MQTT_TOPIC_GPS = "adj/datalogger/sensors/gps"
+MQTT_TOPIC_ALL = "adj/datalogger/sensors"   # NOTE: Code below *only* sends all data, 
+                                            # both GPS and accelerometer data is sent by boards together is parsed
 MQTT_TOPIC = "sensor/railway/accelerometer/stm32"
 BAUD_RATE = 115200
 SERIAL_PORT = None  # Will auto-detect
@@ -66,18 +70,30 @@ def parse_accelerometer_data(line, option):
     Parse the USART output line: "X=1  Y=-13  Z=-262"
     Returns tuple (x_g, y_g, z_g, x_raw, y_raw, z_raw)
     """
+
     # Pattern to match X=1 Y=-13 Z=-262 (handles negative numbers)
-    pattern = r'X=(-?\d+)\s+Y=(-?\d+)\s+Z=(-?\d+)'
+    # pattern = r'X=(-?\d+)\s+Y=(-?\d+)\s+Z=(-?\d+)'
+    # Pattern to match float values (with decimal place)
+    pattern = r'X=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+Y=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+Z=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+    #pattern = r'''
+    #    X=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+
+    #    Y=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+
+    #    Z=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+
+    #    GPS_DATE="([^"]+)"\s+
+    #    GPS_TIME="([^"]+)"\s+
+    #    GPS_CORDS="([^,]+),\s*([^,]+),\s*([^"]+)"
+    #    '''
     match = re.search(pattern, line)
     
     if match:
+        # print (f"unparsed line: {line}")
         # ADXL345 with ±2g range: 1g = 256 LSB
         # At rest, Z should read about +256 (1g) or -256 depending on orientation
         SCALE_FACTOR = 256.0
         
-        x_raw = int(match.group(1))
-        y_raw = int(match.group(2))
-        z_raw = int(match.group(3))
+        x_raw = float (match.group(1))
+        y_raw = float (match.group(2))
+        z_raw = float (match.group(3))
         
         # Convert to g
         x_g = x_raw / SCALE_FACTOR
