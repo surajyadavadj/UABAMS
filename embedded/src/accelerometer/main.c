@@ -81,8 +81,11 @@ int main(void)
     usart_debug("CONNECT REQUEST SENT\r\n");
     W5500_TCP_Client_Connect(0, server_ip, 5000);
 
-    /* -- nk. REVISIT  Bug: Waits on sockets forever */
-    while (W5500_GetSocketStatus(0) != 0x17);
+    /* -- nk. REVISIT  Bug: Waits on sockets forever 
+     Just doing once 
+    HACK -- while (W5500_GetSocketStatus(0) != 0x17);
+    */
+    W5500_GetSocketStatus(0);
 
     usart_debug("TCP CONNECTED\r\n");
 
