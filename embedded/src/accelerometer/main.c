@@ -16,6 +16,9 @@
 #define EVENT_TH     2.0f
 
 // TCP IP
+/* -- nk REVISIT:  MAC, IPs all hard-coded? MAC should be got from firmware?
+  IP should ideally be 10.x.x.x ?
+ */
 uint8_t mac[]       = {0x00,0x08,0xDC,0x11,0x22,0x10};
 uint8_t ip[]        = {192,168,1,10};
 uint8_t sn[]        = {255,255,255,0};
@@ -65,7 +68,7 @@ int main(void)
     USART2_Init();
     spi1_init();          // ADXL SPI
     SPI2_Init();          // W5500 SPI
-SysTick_Config(SystemCoreClock / 1000);
+    SysTick_Config(SystemCoreClock / 1000);
     usart_debug("\r\nDATA LOGGER BOOT\r\n");
 
   //  W5500 INIT 
@@ -78,7 +81,11 @@ SysTick_Config(SystemCoreClock / 1000);
     usart_debug("CONNECT REQUEST SENT\r\n");
     W5500_TCP_Client_Connect(0, server_ip, 5000);
 
-    while (W5500_GetSocketStatus(0) != 0x17);
+    /* -- nk. REVISIT  Bug: Waits on sockets forever 
+     Just doing once 
+    HACK -- while (W5500_GetSocketStatus(0) != 0x17);
+    */
+    W5500_GetSocketStatus(0);
 
     usart_debug("TCP CONNECTED\r\n");
 
@@ -94,22 +101,22 @@ SysTick_Config(SystemCoreClock / 1000);
 
     while (1)
     {
-            float sum_z1 = 0, sum_x1 = 0;
-            float sum_z2 = 0, sum_x2 = 0;
-            float sumsq_z1 = 0, sumsq_x1 = 0;
-            float sumsq_z2 = 0, sumsq_x2 = 0;
+        float sum_z1 = 0, sum_x1 = 0;
+        float sum_z2 = 0, sum_x2 = 0;
+        float sumsq_z1 = 0, sumsq_x1 = 0;
+        float sumsq_z2 = 0, sumsq_x2 = 0;
 
-            float mean_z1, mean_x1, mean_z2, mean_x2;
-            float sd_sum_z1 = 0, sd_sum_x1 = 0;
-            float sd_sum_z2 = 0, sd_sum_x2 = 0;
+        float mean_z1, mean_x1, mean_z2, mean_x2;
+        float sd_sum_z1 = 0, sd_sum_x1 = 0;
+        float sd_sum_z2 = 0, sd_sum_x2 = 0;
 
-            s1_peak = s2_peak = 0.0f;
+        s1_peak = s2_peak = 0.0f;
 
-            float s1_p2p_v = 2.0f * s1_sd_v;
-    float s1_p2p_l = 2.0f * s1_sd_l;
+        float s1_p2p_v = 2.0f * s1_sd_v;
+        float s1_p2p_l = 2.0f * s1_sd_l;
 
-    float s2_p2p_v = 2.0f * s2_sd_v;
-    float s2_p2p_l = 2.0f * s2_sd_l;
+        float s2_p2p_v = 2.0f * s2_sd_v;
+        float s2_p2p_l = 2.0f * s2_sd_l;
 
         //  SAMPLING 
         for (int i=0;i<SAMPLE_COUNT;i++)
@@ -159,79 +166,93 @@ SysTick_Config(SystemCoreClock / 1000);
         s2_sd_l=sqrtf(sd_sum_x2/SAMPLE_COUNT);
 
 
-//   CONTINUOUS REPORT 
-usart_debug("\r\n----- UBMS CONTINUOUS DATA -----\r\n");
-usart_debug("COACH_ID : C1\r\n");
-usart_debug("BOGIE_ID : B1\r\n");
+        //   CONTINUOUS REPORT 
+        usart_debug("\r\n----- UBMS CONTINUOUS DATA -----\r\n");
+        usart_debug("COACH_ID : C1\r\n");
+        usart_debug("BOGIE_ID : B1\r\n");
 
 
-        //  PACKET 
-snprintf(tcp_buf,sizeof(tcp_buf),
-"\r\n[AXLE BOX LEFT - S1]\r\n"
-"Ax : %.3f g  Ay : %.3f g  Az : %.3f g\r\n"
-"RMS-V : %.3f g\r\n"
-"RMS-L : %.3f g\r\n"
-"SD-V  : %.3f g\r\n"
-"SD-L  : %.3f g\r\n"
-"P2P-V : %.3f g\r\n"
-"P2P-L : %.3f g\r\n"
-"PEAK  : %.3f g\r\n",
-s1_x[SAMPLE_COUNT-1], y1, s1_z[SAMPLE_COUNT-1],
-s1_rms_v, s1_rms_l,
-s1_sd_v,  s1_sd_l,
-2.0f*s1_sd_v, 2.0f*s1_sd_l,
-s1_peak
-);
+                //  PACKET 
+        snprintf(tcp_buf,sizeof(tcp_buf),
+        "\r\n[AXLE BOX LEFT - S1]\r\n"
+        "Ax : %.3f g  Ay : %.3f g  Az : %.3f g\r\n"
+        "RMS-V : %.3f g\r\n"
+        "RMS-L : %.3f g\r\n"
+        "SD-V  : %.3f g\r\n"
+        "SD-L  : %.3f g\r\n"
+        "P2P-V : %.3f g\r\n"
+        "P2P-L : %.3f g\r\n"
+        "PEAK  : %.3f g\r\n",
+        s1_x[SAMPLE_COUNT-1], y1, s1_z[SAMPLE_COUNT-1],
+        s1_rms_v, s1_rms_l,
+        s1_sd_v,  s1_sd_l,
+        2.0f*s1_sd_v, 2.0f*s1_sd_l,
+        s1_peak
+        );
 
-usart_debug(tcp_buf);
- UBMS_Send_TCP(tcp_buf);
+        usart_debug(tcp_buf);
+        UBMS_Send_TCP(tcp_buf);
 
-
-snprintf(tcp_buf,sizeof(tcp_buf),
-"\r\n[AXLE BOX RIGHT - S2]\r\n"
-"Ax : %.3f g  Ay : %.3f g  Az : %.3f g\r\n"
-"RMS-V : %.3f g\r\n"
-"RMS-L : %.3f g\r\n"
-"SD-V  : %.3f g\r\n"
-"SD-L  : %.3f g\r\n"
-"P2P-V : %.3f g\r\n"
-"P2P-L : %.3f g\r\n"
-"PEAK  : %.3f g\r\n",
-s2_x[SAMPLE_COUNT-1], y2, s2_z[SAMPLE_COUNT-1],
-s2_rms_v, s2_rms_l,
-s2_sd_v,  s2_sd_l,
-2.0f*s2_sd_v, 2.0f*s2_sd_l,
-s2_peak
-);
-
-usart_debug(tcp_buf);
- UBMS_Send_TCP(tcp_buf);
-
-snprintf(tcp_buf,sizeof(tcp_buf),
-"\r\nFS     : %d Hz\r\n"
-"WINDOW : %d ms\r\n",
-FS_HZ, WINDOW_MS);
-
-usart_debug(tcp_buf);
- UBMS_Send_TCP(tcp_buf);
+        /* Front end x,y,z accelerometer format. Bug: Both accelerometers sent together */
+        snprintf(tcp_buf,sizeof(tcp_buf),
+		"X=%.3f Y=%.3f Z=%.3f\r\n",
+		s1_x[SAMPLE_COUNT-1], y1, s1_z[SAMPLE_COUNT-1]);
+        usart_debug(tcp_buf);
+        UBMS_Send_TCP(tcp_buf);
 
 
+        snprintf(tcp_buf,sizeof(tcp_buf),
+        "\r\n[AXLE BOX RIGHT - S2]\r\n"
+        "Ax : %.3f g  Ay : %.3f g  Az : %.3f g\r\n"
+        "RMS-V : %.3f g\r\n"
+        "RMS-L : %.3f g\r\n"
+        "SD-V  : %.3f g\r\n"
+        "SD-L  : %.3f g\r\n"
+        "P2P-V : %.3f g\r\n"
+        "P2P-L : %.3f g\r\n"
+        "PEAK  : %.3f g\r\n",
+        s2_x[SAMPLE_COUNT-1], y2, s2_z[SAMPLE_COUNT-1],
+        s2_rms_v, s2_rms_l,
+        s2_sd_v,  s2_sd_l,
+        2.0f*s2_sd_v, 2.0f*s2_sd_l,
+        s2_peak
+        );
 
-            // EVENT 
-            if (s1_peak >= EVENT_TH || s2_peak >= EVENT_TH)
-            {
-                snprintf(tcp_buf,sizeof(tcp_buf),
-                "\r\n*** EVENT: VIBRATION ALERT ***\r\n"
-                "S1 PEAK : %.2f g (%s)\r\n"
-                "S2 PEAK : %.2f g (%s)\r\n",
-                s1_peak, vib_level(s1_peak),
-                s2_peak, vib_level(s2_peak));
+        usart_debug(tcp_buf);
+        UBMS_Send_TCP(tcp_buf);
 
-                usart_debug(tcp_buf);
-                UBMS_Send_TCP(tcp_buf);
-            }
+        /* Front end x,y,z accelerometer format. Bug: Both accelerometers sent together */
+        snprintf(tcp_buf,sizeof(tcp_buf),
+		"X=%.3f Y=%.3f Z=%.3f\r\n",
+		s2_x[SAMPLE_COUNT-1], y2, s2_z[SAMPLE_COUNT-1]);
+        usart_debug(tcp_buf);
+        UBMS_Send_TCP(tcp_buf);
 
-            usart_debug("UBMS PACKET SENT\r\n");
+
+        snprintf(tcp_buf,sizeof(tcp_buf),
+        "\r\nFS     : %d Hz\r\n"
+        "WINDOW : %d ms\r\n",
+        FS_HZ, WINDOW_MS);
+
+        usart_debug(tcp_buf);
+        UBMS_Send_TCP(tcp_buf);
+
+        
+        // EVENT 
+        if (s1_peak >= EVENT_TH || s2_peak >= EVENT_TH)
+        {
+            snprintf(tcp_buf,sizeof(tcp_buf),
+            "\r\n*** EVENT: VIBRATION ALERT ***\r\n"
+            "S1 PEAK : %.2f g (%s)\r\n"
+            "S2 PEAK : %.2f g (%s)\r\n",
+            s1_peak, vib_level(s1_peak),
+            s2_peak, vib_level(s2_peak));
+
+            usart_debug(tcp_buf);
+            UBMS_Send_TCP(tcp_buf);
+        }
+
+        usart_debug("UBMS PACKET SENT\r\n");
         // usart_debug(tcp_buf);
         // UBMS_Send_TCP(tcp_buf);
     }
