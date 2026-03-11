@@ -15,7 +15,7 @@ void W5500_SetNetwork(uint8_t *mac,
 
 /* ---------- TCP ---------- */
 void W5500_TCP_Server_Init(uint8_t sock, uint16_t port);
-void W5500_TCP_Client_Connect(uint8_t sock,
+int  W5500_TCP_Client_Connect(uint8_t sock,
                               uint8_t *server_ip,
                               uint16_t port);
 

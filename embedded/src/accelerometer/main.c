@@ -86,6 +86,9 @@ typedef struct {
     float s2_last_x, s2_last_y, s2_last_z;
 } WindowStats_t;
 
+/* -- Shared ETH state (LogTask sets, HealthTask clears on link loss) ------- */
+volatile uint8_t g_eth_ok = 0;
+
 /* -- RTOS handles ---------------------------------------------------------- */
 static QueueHandle_t     xAccelQueue;   /* WindowStats_t, depth 4            */
 static SemaphoreHandle_t xSPI2Mutex;    /* guards W5500 SPI2 bus             */
@@ -221,25 +224,40 @@ static void vLogTask(void *pvParam)
     /* -- W5500 TCP connect -- reads health flags set in main(), no re-probe - *
      * Reset already done in main() with delay_ms(). We only need             *
      * SetNetwork + Connect here, and only if ETH was found healthy.          */
-    static uint8_t eth_ok = 0;
-
     if (health_get_w5500() == HEALTH_OK && health_get_phy() == HEALTH_OK) {
         xSemaphoreTake(xSPI2Mutex, portMAX_DELAY);
 
         W5500_SetNetwork(mac, ip, sn, gw);
         vTaskDelay(pdMS_TO_TICKS(200));
         usart_debug("[LOG] connecting TCP...\r\n");
-        W5500_TCP_Client_Connect(0, server_ip, 5000);
 
-        uint8_t status = W5500_GetSocketStatus(0);
-        if (status == 0x17) {   /* SOCK_ESTABLISHED */
-            eth_ok = 1;
-            health_set_tcp(HEALTH_OK);
+        if (W5500_TCP_Client_Connect(0, server_ip, 5000) == 0) {
+            /* CONNECT command accepted; poll Sn_SR until ESTABLISHED (0x17).
+             * The 3-way handshake is asynchronous — W5500_TCP_Client_Connect
+             * only confirms the chip received the CONNECT command, not that
+             * the server replied. Poll up to 5 s (500 x 10 ms). */
+            uint8_t connected = 0;
+            for (int t = 0; t < 500 && !connected; t++) {
+                if (W5500_GetSocketStatus(0) == 0x17) {
+                    connected = 1;
+                } else {
+                    xSemaphoreGive(xSPI2Mutex);
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    xSemaphoreTake(xSPI2Mutex, portMAX_DELAY);
+                }
+            }
+            if (connected) {
+                g_eth_ok = 1;
+                health_set_tcp(HEALTH_OK);
+            } else {
+                health_set_tcp(HEALTH_FAIL);
+            }
         } else {
+            usart_debug("[LOG] W5500 CONNECT command timed out\r\n");
             health_set_tcp(HEALTH_FAIL);
         }
-        health_print_all();   /* now shows final TCP result */
 
+        health_print_all();   /* shows final TCP result */
         xSemaphoreGive(xSPI2Mutex);
     }
 
@@ -274,13 +292,13 @@ static void vLogTask(void *pvParam)
                 2.0f * stats.s1_sd_v, 2.0f * stats.s1_sd_l,
                 stats.s1_peak);
             usart_debug(tcp_buf);
-            if (eth_ok) UBMS_Send_TCP(tcp_buf);
+            if (g_eth_ok) UBMS_Send_TCP(tcp_buf);
 
             snprintf(tcp_buf, sizeof(tcp_buf),
                 "X=%.3f Y=%.3f Z=%.3f\r\n",
                 stats.s1_last_x, stats.s1_last_y, stats.s1_last_z);
             usart_debug(tcp_buf);
-            if (eth_ok) UBMS_Send_TCP(tcp_buf);
+            if (g_eth_ok) UBMS_Send_TCP(tcp_buf);
         }
 
         /* -- S2 packet (only if sensor is operational) -- */
@@ -302,13 +320,13 @@ static void vLogTask(void *pvParam)
                 2.0f * stats.s2_sd_v, 2.0f * stats.s2_sd_l,
                 stats.s2_peak);
             usart_debug(tcp_buf);
-            if (eth_ok) UBMS_Send_TCP(tcp_buf);
+            if (g_eth_ok) UBMS_Send_TCP(tcp_buf);
 
             snprintf(tcp_buf, sizeof(tcp_buf),
                 "X=%.3f Y=%.3f Z=%.3f\r\n",
                 stats.s2_last_x, stats.s2_last_y, stats.s2_last_z);
             usart_debug(tcp_buf);
-            if (eth_ok) UBMS_Send_TCP(tcp_buf);
+            if (g_eth_ok) UBMS_Send_TCP(tcp_buf);
         }
 
         /* -- FS / window line -- */
@@ -316,7 +334,7 @@ static void vLogTask(void *pvParam)
             "\r\nFS     : %d Hz\r\nWINDOW : %d ms\r\n",
             FS_HZ, WINDOW_MS);
         usart_debug(tcp_buf);
-        if (eth_ok) UBMS_Send_TCP(tcp_buf);
+        if (g_eth_ok) UBMS_Send_TCP(tcp_buf);
 
         /* -- Event alert (only for valid sensors) -- */
         if ((stats.s1_valid && stats.s1_peak >= EVENT_TH) ||
@@ -328,7 +346,7 @@ static void vLogTask(void *pvParam)
                 stats.s1_peak, vib_level(stats.s1_peak),
                 stats.s2_peak, vib_level(stats.s2_peak));
             usart_debug(tcp_buf);
-            if (eth_ok) UBMS_Send_TCP(tcp_buf);
+            if (g_eth_ok) UBMS_Send_TCP(tcp_buf);
         }
 
         usart_debug("UBMS PACKET SENT\r\n");
@@ -369,7 +387,13 @@ static void vHealthTask(void *pvParam)
         uint8_t eth_health_flag = ( ((ver == 0x04) && (phy & 0x01))  ? HEALTH_OK : HEALTH_FAIL);
         health_set_w5500 (eth_health_flag, ver);
         health_set_phy (eth_health_flag);
-        health_set_tcp (eth_health_flag);
+
+        /* If PHY/MAC is gone, stop LogTask sending on a dead socket.
+         * g_eth_ok is only re-armed by LogTask on a successful reconnect. */
+        if (eth_health_flag == HEALTH_FAIL) {
+            g_eth_ok = 0;
+            health_set_tcp(HEALTH_FAIL);
+        }
 
         xSemaphoreGive(xSPI2Mutex);
 
