@@ -12,8 +12,8 @@ import Map from './pages/Map';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 
-// Import the new Topbar Layout
-import TopbarLayout from './components/Layout/TopbarLayout';
+// Import the new Desktop App Layout
+import DesktopAppLayout from './components/Layout/DesktopAppLayout';
 
 // Import your context providers
 import { AlertProvider } from './context/AlertContext';
@@ -28,12 +28,22 @@ const theme = createTheme({
       main: '#dc004e',
     },
     background: {
-      default: '#0a1929',
-      paper: '#1e293b',
+      default: '#1e1e1e',
+      paper: '#252526',
     },
   },
   typography: {
-    fontFamily: '"Roboto", "Helvetica", "Arial", sans-serif',
+    fontFamily: '"Segoe UI", "Roboto", "Helvetica", "Arial", sans-serif',
+    fontSize: 13,
+  },
+  components: {
+    MuiPaper: {
+      styleOverrides: {
+        root: {
+          backgroundImage: 'none',
+        },
+      },
+    },
   },
 });
 
@@ -43,7 +53,7 @@ function App() {
       <CssBaseline />
       <AlertProvider>
         <Router>
-          <TopbarLayout>  {/* This wraps all pages with the topbar */}
+          <DesktopAppLayout>
             <Routes>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<Dashboard />} />
@@ -54,7 +64,7 @@ function App() {
               <Route path="/reports" element={<Reports />} />
               <Route path="/settings" element={<Settings />} />
             </Routes>
-          </TopbarLayout>
+          </DesktopAppLayout>
         </Router>
       </AlertProvider>
     </ThemeProvider>
