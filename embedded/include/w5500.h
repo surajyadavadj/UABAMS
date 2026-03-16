@@ -25,7 +25,13 @@ uint8_t W5500_GetSocketStatus(uint8_t sock);
 int W5500_Send(uint8_t sock, uint8_t *buf, uint16_t len);
 int W5500_Recv(uint8_t sock, uint8_t *buf, uint16_t maxlen);
 
+<<<<<<< HEAD
 /* ------- CHIP CONTROL ---------- */
+=======
+void W5500_CloseSocket(uint8_t sock);
+
+/* ---------- CHIP CONTROL ---------- */
+>>>>>>> 1d72ce2 (update ethernet fix)
 /* These macros must already exist somewhere */
 #define W5500_CS_LOW()   (GPIOB->BSRR = (1 << (12 + 16)))
 #define W5500_CS_HIGH()  (GPIOB->BSRR = (1 << 12))

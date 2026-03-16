@@ -1,5 +1,5 @@
 # Root Makefile for UABAMS
-TOOLCHAIN_PREFIX ?= /usr/local/bin/gcc-arm-none-eabi-10.3-2021.10/bin/
+TOOLCHAIN_PREFIX ?=
 export CC      = $(TOOLCHAIN_PREFIX)arm-none-eabi-gcc
 export OBJCOPY = $(TOOLCHAIN_PREFIX)arm-none-eabi-objcopy
 export MCU     = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
@@ -17,6 +17,8 @@ COMMON_SRC = \
  usart_debug.c \
  spi2.c \
  w5500.c \
+ boot_info.c \
+ ethernet_health.c \
  system_stm32f4xx.c \
  startup.s \
  syscalls.c
