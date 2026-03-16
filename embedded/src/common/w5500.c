@@ -227,3 +227,20 @@ int W5500_Send(uint8_t sock, uint8_t *buf, uint16_t len)
 
     return len;
 }
+
+/* -------------------------------------------------
+   Close Socket
+------------------------------------------------- */
+void W5500_CloseSocket(uint8_t sock)
+{
+    uint8_t block = 0x08 | (sock << 5);
+    
+    // Send CLOSE command (0x01) to Sn_CR
+    W5500_Write(0x0001, block, 0x01);
+    
+    // Wait for command to complete
+    W5500_WaitCommand(sock);
+    
+    // Optional: Clear socket configuration
+    // W5500_Write(0x0000, block, 0x00);  // Sn_MR = closed
+}

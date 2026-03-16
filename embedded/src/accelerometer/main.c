@@ -46,6 +46,9 @@
 #include "clock_config.h"
 #include "delay.h"
 #include "health.h"
+#include "boot_info.h"
+#include "accelerometer_health.h"
+#include "ethernet_health.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -64,8 +67,8 @@
 #define HEALTH_CHECK_MS  (1000*30)   /* HealthTask re-check interval. 30 seconds */
 
 /* -- Network config --------------------------------------------------------- */
-static uint8_t mac[]       = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x10};
-static uint8_t ip[]        = {192, 168, 1, 10};
+uint8_t mac[]       = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x10};
+uint8_t ip[]        = {192, 168, 1, 10};
 static uint8_t sn[]        = {255, 255, 255, 0};
 static uint8_t gw[]        = {0, 0, 0, 0};
 static uint8_t server_ip[] = {192, 168, 1, 100};
@@ -108,6 +111,24 @@ static const char *vib_level(float peak)
 static void UBMS_Send_TCP(char *data)
 {
     W5500_Send(0, (uint8_t *)data, strlen(data));
+}
+
+/* -- TCP Connection Management Function (from main.c1) --------------------- */
+void TCP_Task(void)
+{
+    uint8_t status = W5500_GetSocketStatus(0);
+    if (status == 0x17)
+    {
+        g_eth_ok = 1;
+        health_set_tcp(HEALTH_OK);
+    }
+    else
+    {
+        g_eth_ok = 0;
+        health_set_tcp(HEALTH_FAIL);
+        // reconnect try
+        W5500_TCP_Client_Connect(0, server_ip, 5000);
+    }
 }
 
 /* -- SysTick -- combined handler ------------------------------------------ *
@@ -271,6 +292,9 @@ static void vLogTask(void *pvParam)
 
         xSemaphoreTake(xSPI2Mutex, portMAX_DELAY);
 
+        /* Call TCP_Task to maintain connection status */
+        TCP_Task();
+
         usart_debug("\r\n----- UBMS CONTINUOUS DATA -----\r\n");
 
         /* -- S1 packet (only if sensor is operational) -- */
@@ -350,6 +374,12 @@ static void vLogTask(void *pvParam)
         }
 
         usart_debug("UBMS PACKET SENT\r\n");
+
+        if (g_eth_ok) {
+            usart_debug("TCP_Connected --------------------------------------\r\n");
+        } else {
+            usart_debug("TCP_NOT _Connected ----------------------------------\r\n");
+        }
 
         xSemaphoreGive(xSPI2Mutex);
     }
@@ -437,11 +467,26 @@ int main(void)
     SystemClock_Config();
 
     USART2_Init();
+    print_boot_info("DATA LOGGER UNIT");  /* From boot_info.h */
+    usart_debug("SYSTEM INITIALIZATION...\r\n");
+
     spi1_init();    /* ADXL345 x2 on SPI1 */
+    
+    /* Sensor health checks from accelerometer_health.h */
+    sensor_spi_health_check();
+    sensor_max_range_check(1);
+    sensor_max_range_check(2);
+    sensor_static_check();
+    
     SPI2_Init();    /* W5500 on SPI2       */
+    
+    /* Ethernet health checks from ethernet_health.h */
+    spi2_w5500_check();
+    ethernet_hardware_check();
 
     /* 1 ms SysTick -- FreeRTOS reconfigures to same rate; combined handler above */
     SysTick_Config(SystemCoreClock / 1000);
+    usart_debug("\r\nDATA LOGGER BOOT\r\n");
 
     /* ── Board info banner ─────────────────────────────────────────────────── */
     usart_debug("========================================\r\n");
@@ -458,7 +503,11 @@ int main(void)
     usart_debug("  Buses: SPI1 (ADXL345 x2), SPI2 (W5500), USART2\r\n");
     usart_debug("========================================\r\n");
 
-    /* ── Peripheral health checks ──────────────────────────────────────────── *
+    /* ── W5500 INIT (from main.c1) ──────────────────────────────────────── */
+    W5500_RST_LOW();  delay_ms(50);
+    W5500_RST_HIGH(); delay_ms(300);
+
+    /* ── Peripheral health checks ────────────────────────────────────────── *
      * ADXL345: read WHO_AM_I (0xE5 expected) -- init only on ID pass.        *
      * W5500:   reset with delay_ms() (safe pre-scheduler, SysTick configured) *
      *          then read version (0x04 expected) and PHY link status.        *
@@ -472,16 +521,17 @@ int main(void)
     health_set_sensor(2, id2 == 0xE5 ? HEALTH_OK : HEALTH_FAIL, id2);
     if (health_get_sensor(2) == HEALTH_OK) adxl345_init(2);
 
-    W5500_RST_LOW();
-    delay_ms(10);    /* datasheet: >= 1 ms reset pulse */
-    W5500_RST_HIGH();
-    delay_ms(300);   /* datasheet: 300 ms PLL stabilise */
-
     uint8_t ver = W5500_ReadVersion();
     uint8_t phy = W5500_GetPHYStatus();
     uint8_t eth_health_flag = ((ver == 0x04) &&  (phy & 0x01)) ? HEALTH_OK : HEALTH_FAIL;
     health_set_w5500(eth_health_flag, ver);
     health_set_phy(eth_health_flag);
+
+    W5500_SetNetwork(mac, ip, sn, gw);
+    delay_ms(1000);
+
+    usart_debug("CONNECT REQUEST SENT\r\n");
+    W5500_TCP_Client_Connect(0, server_ip, 5000);
 
     health_print_all();   /* TCP shows PENDING; LogTask will update and reprint */
     usart_debug("[INIT] Ready. Starting scheduler...\r\n");

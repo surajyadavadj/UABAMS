@@ -28,7 +28,7 @@
 /* ── Heap (heap_4.c) ────────────────────────────────────────────────────── *
  * 20 KB covers all tasks + TCBs + queue + mutexes with ~11 KB to spare.    *
  * See README.FreeRTOS.md §Step 2 for the full memory estimate.             */
-#define configTOTAL_HEAP_SIZE                   (20 * 1024)
+#define configTOTAL_HEAP_SIZE                   ((size_t)65536) 
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
 
 /* ── Synchronisation primitives ─────────────────────────────────────────── */
