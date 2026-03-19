@@ -216,7 +216,7 @@ int W5500_Send(uint8_t sock, uint8_t *buf, uint16_t len)
         W5500_Write(offset, tx_block, buf[i]);
     }
 
-    /* 3. Update TX write pointer */
+    // 3. Update TX write pointer 
     tx_wr += len;
     W5500_Write(0x0024, sock_block, (tx_wr >> 8) & 0xFF);
     W5500_Write(0x0025, sock_block,  tx_wr & 0xFF);
@@ -226,4 +226,21 @@ int W5500_Send(uint8_t sock, uint8_t *buf, uint16_t len)
     W5500_WaitCommand(sock);
 
     return len;
+}
+
+/* -------------------------------------------------
+   Close Socket
+------------------------------------------------- */
+void W5500_CloseSocket(uint8_t sock)
+{
+    uint8_t block = 0x08 | (sock << 5);
+    
+    // Send CLOSE command (0x01) to Sn_CR
+    W5500_Write(0x0001, block, 0x01);
+    
+    // Wait for command to complete
+    W5500_WaitCommand(sock);
+    
+    // Optional: Clear socket configuration
+    // W5500_Write(0x0000, block, 0x00);  // Sn_MR = closed
 }
