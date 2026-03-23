@@ -90,7 +90,8 @@ const initCouchDB = async () => {
 initCouchDB();
 
 // MQTT Connection
-const mqttClient = mqtt.connect(`mqtt://${LOCAL_IP}:1883`);
+// const mqttClient = mqtt.connect(`mqtt://${LOCAL_IP}:1883`);
+const mqttClient = mqtt.connect(`mqtt://localhost:1883`);
 
 // ============================================
 // API ENDPOINTS
