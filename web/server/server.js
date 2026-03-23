@@ -5,6 +5,21 @@ const mqtt = require('mqtt');
 const cors = require('cors');
 const path = require('path');
 const fs   = require('fs');
+const os   = require('os');
+
+function getLocalIP() {
+    const interfaces = os.networkInterfaces();
+    for (const iface of Object.values(interfaces)) {
+        for (const addr of iface) {
+            if (addr.family === 'IPv4' && !addr.internal) {
+                return addr.address;
+            }
+        }
+    }
+    return '127.0.0.1';
+}
+
+const LOCAL_IP = getLocalIP();
 
 // ── Persistent JSON peak log ───────────────────────────────────────────────
 const PEAKS_LOG_FILE = path.join(__dirname, 'peaks_log.json');
@@ -75,7 +90,7 @@ const initCouchDB = async () => {
 initCouchDB();
 
 // MQTT Connection
-const mqttClient = mqtt.connect('mqtt://192.168.0.156:1883');
+const mqttClient = mqtt.connect(`mqtt://${LOCAL_IP}:1883`);
 
 // ============================================
 // API ENDPOINTS
@@ -638,8 +653,9 @@ console.log('loadPage function loaded and available');
 const PORT = 5000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Frontend: http://192.168.0.156:${PORT}/index.html`);
-    console.log(`API endpoints: http://192.168.0.156:${PORT}/api/`);
+    console.log(`Local IP: ${LOCAL_IP}`);
+    console.log(`Frontend: http://${LOCAL_IP}:${PORT}/index.html`);
+    console.log(`API endpoints: http://${LOCAL_IP}:${PORT}/api/`);
     console.log(`CouchDB Admin: http://127.0.0.1:5984/_utils/`);
-    console.log(`Health check: http://192.168.0.156:${PORT}/health`);
+    console.log(`Health check: http://${LOCAL_IP}:${PORT}/health`);
 });
