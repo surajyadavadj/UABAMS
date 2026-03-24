@@ -5,9 +5,24 @@ const mqtt      = require('mqtt');
 const cors      = require('cors');
 const path      = require('path');
 const fs        = require('fs');
+const os        = require('os');
 
 // ── Persistent JSON fallback ──────────────────────────────────────────────
 const PEAKS_LOG_FILE = path.join(__dirname, 'peaks_log.json');
+
+function getLocalIP() {
+    const interfaces = os.networkInterfaces();
+    for (const iface of Object.values(interfaces)) {
+        for (const addr of iface) {
+            if (addr.family === 'IPv4' && !addr.internal) {
+                return addr.address;
+            }
+        }
+    }
+    return '127.0.0.1';
+}
+
+const LOCAL_IP = getLocalIP();
 
 function loadPeaksLog() {
     try {
@@ -25,7 +40,7 @@ let peaksLog = loadPeaksLog();
 console.log(`Loaded ${peaksLog.length} existing impact records from JSON fallback`);
 
 // ── Express / Socket.IO ───────────────────────────────────────────────────
-const nano   = require('nano')('http://USER:PASSWORD@127.0.0.1:5984');
+const nano   = require('nano')('http://admin:ogdenmash@127.0.0.1:5984');
 const app    = express();
 const server = http.createServer(app);
 const io     = socketIo(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
@@ -82,9 +97,11 @@ initCouchDB();
 // ── MQTT ──────────────────────────────────────────────────────────────────
 let lastDataTimestamp = null;
 let mqttConnected     = false;
-const mqttClient      = mqtt.connect('mqtt://localhost:1883');
+// const mqttClient      = mqtt.connect('mqtt://localhost:1883');
+const mqttClient = mqtt.connect(`mqtt://localhost:1883`);
 
 // ── Health parser ─────────────────────────────────────────────────────────
+// TODO: Details of peripherals to be fetched from controller encoded in msg.
 function parseHealthMessage(msgStr) {
     const get = pattern => {
         const m = msgStr.match(pattern);
@@ -583,8 +600,9 @@ mqttClient.on('message', async (topic, message) => {
 const PORT = 5000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Frontend: http://192.168.0.136:${PORT}/index.html`);
-    console.log(`API:      http://192.168.0.125:${PORT}/api/`);
+    console.log(`Local IP: ${LOCAL_IP}`);
+    console.log(`Frontend: http://${LOCAL_IP}:${PORT}/index.html`);
+
     console.log(`CouchDB:  http://127.0.0.1:5984/_utils/`);
 });
 
