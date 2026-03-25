@@ -1,5 +1,5 @@
 # Root Makefile for UABAMS
-export TOOLCHAIN_PREFIX ?= /usr/local/bin/gcc-arm-none-eabi-10.3-2021.10/bin/
+TOOLCHAIN_PREFIX ?=
 export CC      = $(TOOLCHAIN_PREFIX)arm-none-eabi-gcc
 export OBJCOPY = $(TOOLCHAIN_PREFIX)arm-none-eabi-objcopy
 export MCU     = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
