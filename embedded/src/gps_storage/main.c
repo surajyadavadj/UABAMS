@@ -9,13 +9,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-
 // FreeRTOS headers
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-#include "semphr.h"
-
+#include <stdarg.h>
 #include "gps_health.h"
 
 extern volatile uint32_t ms_ticks;
@@ -44,6 +42,7 @@ void SysTick_Handler(void)
         xPortSysTickHandler();
     }
 }
+
 
 // delay function (kept for compatibility)
 void delay(void)
@@ -91,7 +90,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 }
 
 //  Task 2: TCPSimpleTask
-void vTCPSimpleTask(void *pvParam)
+void vTCPEthernetTask(void *pvParam)
 {
     (void)pvParam;
     uint8_t rx_buf[512];
@@ -131,18 +130,23 @@ void vTCPSimpleTask(void *pvParam)
                     connected = 1;
                 }
                 int len;
-                while(
-                 len = W5500_Recv(0, rx_buf, sizeof(rx_buf) > 0))
-                 {
+                // Receive data (leave 1 byte for null terminator)
+                while((len = W5500_Recv(0, rx_buf, sizeof(rx_buf) - 1)) > 0)
+                {
                     rx_buf[len] = '\0';
                     usart_debug((char*)rx_buf);
-                 }
-                if (len > 0) {
-                    rx_buf[len] = '\0';
-                    usart_debug("\r\n[RECEIVED %d bytes]\r\n", len);
-                    usart_debug("Data: %s\r\n", rx_buf);
-                    // char *reply = "ACK from Junction Box\r\n";
-                    // W5500_Send(0, (uint8_t*)reply, strlen(reply));
+
+                    // Print GPS data ONLY when we reach the end of a message (newline)
+                    // and GPS fix is valid.
+                    if (rx_buf[len-1] == '\n' && gps_data.valid)
+                    {
+                        usart_debug("\r\n[GPS] T-%02d:%02d:%02d D-%02d-%02d-%04d LAT:%ld%c LON:%ld%c SPD:%ldcm/s\r\n",
+                            gps_data.hour, gps_data.minute, gps_data.second,
+                            gps_data.day,  gps_data.month,  gps_data.year,
+                            gps_data.lat_i, gps_data.ns,
+                            gps_data.lon_i, gps_data.ew,
+                        gps_data.speed_cms);
+                    }
                 }
                 break;
 
@@ -179,68 +183,15 @@ void vGPSTask(void *pvParam)
 {
     (void)pvParam;
 
-    uint8_t  ch;
-    uint8_t  prev_valid      = 0;
-    uint32_t bytes_rx        = 0;
-    uint32_t last_print_tick = 0;
-
-    usart_debug("[GPSTask] started\r\n");
+    uint16_t  ch;
+    usart_debug("[GPSTask] Background parser started\r\n");
 
     for (;;)
     {
-        // Block up to 5 s waiting for a byte from the USART6 ISR.
-        // If the timeout fires with bytes_rx still 0, the module is absent/unwired.
-        if (xQueueReceive(gpsQueue, &ch, pdMS_TO_TICKS(5000)) == pdTRUE)
+        // Block indefinitely waiting for a byte from the USART6 ISR.
+        if (xQueueReceive(gpsQueue, &ch, portMAX_DELAY) == pdTRUE)
         {
             gps_feed((char)ch);
-            bytes_rx++;
-        }
-
-        uint32_t now = ms_ticks;
-
-        if (gps_data.valid)
-        {
-            if (!prev_valid)
-            {
-                usart_debug("\r\n[GPS] FIX ACQUIRED\r\n");
-                prev_valid      = 1;
-                last_print_tick = now;
-            }
-
-            // Print position once per second
-            if ((now - last_print_tick) >= 1000)
-            {
-                last_print_tick = now;
-                usart_debug("LAT:%ld%c LON:%ld%c  %02d:%02d:%02d %02d-%02d-%04d  SPD:%lu cm/s\r\n",
-                    gps_data.lat_i, gps_data.ns,
-                    gps_data.lon_i, gps_data.ew,
-                    gps_data.hour, gps_data.minute, gps_data.second,
-                    gps_data.day,  gps_data.month,  gps_data.year,
-                    gps_data.speed_cms);
-            }
-        }
-        else
-        {
-            if (prev_valid)
-            {
-                usart_debug("[GPS] FIX LOST\r\n");
-                prev_valid      = 0;
-                last_print_tick = now;
-            }
-
-            // Print diagnostic once every 5 s — two cases:
-            //   bytes_rx == 0 → no serial data at all (wiring/power problem)
-            //   bytes_rx  > 0 → data arriving but no satellite fix yet
-            if ((now - last_print_tick) >= 5000)
-            {
-                last_print_tick = now;
-                if (bytes_rx == 0)
-                    usart_debug("[GPS] NO SIGNAL -- check PC7 wiring (SR:0x%04x)\r\n",
-                        (unsigned)USART6->SR);
-                else
-                    usart_debug("[GPS] WAITING FOR FIX  (bytes:%lu  SR:0x%04x)\r\n",
-                        bytes_rx, (unsigned)USART6->SR);
-            }
         }
     }
 }
@@ -259,7 +210,7 @@ static void vUartTask(void *pvParam)
     {
         if (xQueueReceive(uartQueue, &ch, portMAX_DELAY))
         {
-            // 🔥 DEBUG (IMPORTANT)
+            //  DEBUG (IMPORTANT)
             usart_debug("RX: %c\r\n", ch);
 
             // store character
@@ -287,10 +238,28 @@ static void vUartTask(void *pvParam)
                     vTaskDelay(pdMS_TO_TICKS(100));
                     NVIC_SystemReset();
                 }
+                else if (strncmp(buffer, "HEALTH", 6) == 0)
+                {
+                    usart_debug("HEALTH...\r\n");
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    gps_health_check();
+                }
 
                 idx = 0; // reset buffer
             }
         }
+    }
+}
+void vGPSHealthTask(void *pvParam)
+{
+    (void)pvParam;
+
+    for (;;)
+    {
+        usart_debug("\r\n[GPS HEALTH]\r\n");
+        gps_health_check();   // print health
+
+        vTaskDelay(pdMS_TO_TICKS(31000)); // 30 sec delay
     }
 }
 
@@ -322,16 +291,15 @@ void USART6_IRQHandler(void)
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+
 int main(void)
 {
-
     // Initialize hardware
     USART2_Init();
-
     /* Queue create */
     uartQueue = xQueueCreate(32, sizeof(uint8_t));
     /* GPS queue + USART6 RX interrupt */
-    gpsQueue = xQueueCreate(128, sizeof(uint8_t));
+    gpsQueue = xQueueCreate(512, sizeof(uint8_t));
 
     /* UART RX interrupt enable */
     USART2->CR1 |= USART_CR1_RE;
@@ -367,15 +335,17 @@ int main(void)
    // TASKS CREATION
 
    // Task 2: TCPSimpleTask
-    if (xTaskCreate(vTCPSimpleTask, "TCP", 512, NULL, 2, NULL) != pdPASS) {
+    if (xTaskCreate(vTCPEthernetTask, "TCP", 1024, NULL, 2, NULL) != pdPASS) {
         usart_debug("Failed to create TCPSimpleTask\r\n");
     } else {
         usart_debug("TCPSimpleTask created\r\n");
     }
 
-    xTaskCreate(vGPSTask, "GPS", 512, NULL, 1, NULL);
+    xTaskCreate(vGPSTask, "GPS", 512, NULL, 3, NULL);
 
     xTaskCreate(vUartTask, "UART", 512, NULL, 3, NULL);
+    xTaskCreate(vGPSHealthTask, "GPS_HEALTH", 512, NULL, 2, NULL);
+
     usart_debug("\r\nAll tasks created. Starting scheduler...\r\n");
     usart_debug("========================================\r\n\r\n");
 
@@ -388,3 +358,4 @@ int main(void)
     usart_debug("FATAL: Scheduler returned\r\n");
     for (;;);
 }
+

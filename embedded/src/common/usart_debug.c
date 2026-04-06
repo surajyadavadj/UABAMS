@@ -152,7 +152,7 @@ void USART2_Init(void) {
 
 // USART2 Debug print function (printf-style)
 void usart_debug(const char* format, ...) {
-    char buffer[256];
+    char buffer[512];
     va_list args;
     va_start(args, format);
     vsnprintf(buffer, sizeof(buffer), format, args);
@@ -163,4 +163,5 @@ void usart_debug(const char* format, ...) {
         USART2_SendChar(buffer[i]);
     }
 }
+
 

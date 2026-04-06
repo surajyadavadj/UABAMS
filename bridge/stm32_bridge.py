@@ -125,6 +125,15 @@ def main():
 
             if not line:
                 continue
+            # ================= GPS =================
+            if "[GPS]" in line:
+                client.publish(MQTT_TOPIC_EVENT_GPS, line)
+
+                print("\n📍 GPS SENT ===")
+                print(line)
+                print("==============\n")
+
+                continue   #  VERY IMPORTANT
 
             # ================= HEALTH START =================
             if "[HEALTH]" in line:
@@ -232,6 +241,7 @@ def main():
                     print("==============\n")
                     right_buffer = []
 
+                    
                 current_sensor = None
 
             time.sleep(0.001)
