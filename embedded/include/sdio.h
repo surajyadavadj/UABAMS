@@ -1,11 +1,35 @@
 #ifndef SDIO_H
 #define SDIO_H
 
+#include <stdint.h>
 
+extern uint16_t g_sd_rca;
+
+/* Init */
+void SystemClock_Config(void);
 void SDIO_Init(void);
-void SDIO_Test(void);
-void SDIO_FullInit_Debug(void);
-int SDIO_SendCMD_Debug(uint8_t cmd, uint32_t arg, uint8_t resp);
+
+/* Debug */
 void SDIO_DebugFull(void);
+void SD_CardDetect_Test(void);
+void SDIO_PinTest(void);
+void SDIO_FullInit_Debug(void);
+
+/* Card */
+int SDIO_CardInit(void);
+uint16_t SD_GetRCA(void);
+int SD_SelectCard(uint16_t rca);
+
+/* Read Write */
+int SD_ReadBlock(uint32_t addr, uint8_t *buf);
+int SD_WriteBlock(uint32_t addr, const uint8_t *buf, uint16_t rca);
+
+/* Test */
+void SD_ReadWriteTest(uint16_t rca);
+void SD_ImageTest(uint16_t rca);
+void SD_WriteTextFiles(uint16_t rca);
+
+/* FATFS */
+void SD_FatFsTest(void);
 
 #endif

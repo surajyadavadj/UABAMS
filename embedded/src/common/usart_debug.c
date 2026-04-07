@@ -164,4 +164,6 @@ void usart_debug(const char* format, ...) {
     }
 }
 
-
+void usart_puts(const char* s) {
+    while (*s) USART2_SendChar(*s++);
+}

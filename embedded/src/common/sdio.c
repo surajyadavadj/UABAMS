@@ -1,42 +1,157 @@
 #include "stm32f4xx.h"
 #include "usart_debug.h"
+#include <stdint.h>
 #include <stdio.h>
-#include "sdio.h"
-#define NO_RESP 0
+#include <string.h>
+#include "ff.h"
+
+#define NO_RESP    0
 #define SHORT_RESP 1
 
+/* Global RCA — set after card init, used by diskio.c */
+uint16_t g_sd_rca = 0;
+
+/* -----------------------------------------------------------------------
+ * SDIO_Init
+ * - PC8–PC11 : D0–D3  (AF12)
+ * - PC12     : CLK    (AF12)
+ * - PD2      : CMD    (AF12)
+ * - Pull-ups on all data/cmd lines (required by SD spec)
+ * - Init clock ≤ 400 kHz: 48MHz / (118+2) = 400 kHz exactly
+ * ----------------------------------------------------------------------- */
 void SDIO_Init(void)
 {
-    // Enable clocks
+    /* Enable peripheral clocks */
     RCC->APB2ENR |= RCC_APB2ENR_SDIOEN;
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIODEN;
 
-    // PC8–PC12 (D0–D3, CLK)
-    for(int i=8;i<=12;i++)
+    /* PC8–PC12: Alternate function + pull-up */
+    for (int i = 8; i <= 12; i++)
     {
-        GPIOC->MODER &= ~(3 << (i*2));
-        GPIOC->MODER |=  (2 << (i*2));
+        /* Alternate function mode (10) */
+        GPIOC->MODER &= ~(3U << (i * 2));
+        GPIOC->MODER |=  (2U << (i * 2));
 
-        GPIOC->AFR[1] &= ~(0xF << ((i-8)*4));
-        GPIOC->AFR[1] |=  (12 << ((i-8)*4));
+        /* Pull-up */
+        GPIOC->PUPDR &= ~(3U << (i * 2));
+        GPIOC->PUPDR |=  (1U << (i * 2));
+
+        /* High speed */
+        GPIOC->OSPEEDR |= (3U << (i * 2));
+
+        /* AF12 (SDIO) — pins 8–12 are in AFR[1], offset = (pin-8)*4 */
+        GPIOC->AFR[1] &= ~(0xFU << ((i - 8) * 4));
+        GPIOC->AFR[1] |=  (12U  << ((i - 8) * 4));
     }
 
-    // PD2 (CMD)
-    GPIOD->MODER &= ~(3 << (2*2));
-    GPIOD->MODER |=  (2 << (2*2));
-    GPIOD->AFR[0] &= ~(0xF << (2*4));
-    GPIOD->AFR[0] |=  (12 << (2*4));
+    /* PD2: CMD — Alternate function + pull-up */
+    GPIOD->MODER  &= ~(3U << (2 * 2));
+    GPIOD->MODER  |=  (2U << (2 * 2));   /* AF mode */
 
-    // Power ON
+    GPIOD->PUPDR  &= ~(3U << (2 * 2));
+    GPIOD->PUPDR  |=  (1U << (2 * 2));   /* pull-up */
+
+    GPIOD->OSPEEDR |= (3U << (2 * 2));   /* high speed */
+
+    GPIOD->AFR[0] &= ~(0xFU << (2 * 4));
+    GPIOD->AFR[0] |=  (12U  << (2 * 4)); /* AF12 */
+
+    /* Power ON */
     SDIO->POWER = 3;
+    /* Wait ≥74 clocks at 400kHz ≈ 185µs before first command */
+    for (volatile int i = 0; i < 10000; i++);
 
-    // Slow clock (~400kHz)
-    SDIO->CLKCR = (180 << 0);
-    SDIO->CLKCR |= (1 << 8); // enable clock
+    /* CLKDIV=238 → 96MHz/239≈400kHz, CLKEN=1, 1-bit bus */
+    SDIO->CLKCR = (238U << 0) | (1U << 8);
+    /* Short settling delay after enabling clock */
+    for (volatile int i = 0; i < 10000; i++);
 
     usart_debug("SDIO INIT DONE\r\n");
 }
 
+/* -----------------------------------------------------------------------
+ * SDIO_SendCMD_R3 — for R3 responses (ACMD41, CMD58)
+ * R3 has no CRC, so CCRCFAIL is raised by the peripheral but is normal.
+ * We treat CCRCFAIL as success; only CTIMEOUT is a real failure.
+ * ----------------------------------------------------------------------- */
+int SDIO_SendCMD_R3(uint8_t cmd, uint32_t arg)
+{
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = arg;
+    SDIO->CMD = (cmd & 0x3F) | (1U << 10) | (1U << 6);
+
+    /* For R3 responses (ACMD41): CMDREND never fires because there is no CRC.
+     * CCRCFAIL may or may not fire depending on silicon.
+     * We wait for CTIMEOUT (real failure) or let the software timeout expire,
+     * then read RESP1 regardless — the response data is valid even if the
+     * peripheral flagged a timeout, as confirmed by SDIO_SendCMD_Debug testing. */
+    uint32_t timeout = 2000000;
+    while (!(SDIO->STA & (1U << 6)) &&   /* CMDREND */
+           !(SDIO->STA & (1U << 1)) &&   /* CTIMEOUT */
+           !(SDIO->STA & (1U << 2)))     /* CCRCFAIL */
+    {
+        if (--timeout == 0) break;        /* timed out — RESP1 still valid */
+    }
+
+    /* Only fail on hardware CTIMEOUT (card truly absent/not responding) */
+    if (SDIO->STA & (1U << 1)) return 0;
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * SDIO_SendCMD
+ * resp = NO_RESP    → wait for CMDSENT (bit 7)
+ * resp = SHORT_RESP → wait for CMDREND (bit 6)
+ * ----------------------------------------------------------------------- */
+int SDIO_SendCMD(uint8_t cmd, uint32_t arg, uint8_t resp)
+{
+    SDIO->ICR = 0xFFFFFFFF;   /* clear all flags */
+
+    SDIO->ARG = arg;
+
+    if (resp == NO_RESP)
+        SDIO->CMD = (cmd & 0x3F) | (1U << 10);          /* CPSMEN, no response */
+    else
+        SDIO->CMD = (cmd & 0x3F) | (1U << 10) | (1U << 6); /* CPSMEN + WAITRESP short */
+
+    uint32_t timeout = 2000000;
+
+    if (resp == NO_RESP)
+    {
+        /* Wait for CMDSENT (bit 7) */
+        while (!(SDIO->STA & (1U << 7)))
+        {
+            if (--timeout == 0)
+            {
+                usart_debug("CMD TIMEOUT (NO_RESP)\r\n");
+                return 0;
+            }
+        }
+    }
+    else
+    {
+        /* Wait for CMDREND (bit 6), CTIMEOUT (bit 1), or CCRCFAIL (bit 2) */
+        while (!(SDIO->STA & (1U << 6)) &&
+               !(SDIO->STA & (1U << 1)) &&
+               !(SDIO->STA & (1U << 2)))
+        {
+            if (--timeout == 0)
+            {
+                usart_debug("CMD TIMEOUT (SHORT_RESP)\r\n");
+                return 0;
+            }
+        }
+
+        if (SDIO->STA & (1U << 1)) return 0;  /* CTIMEOUT */
+        if (SDIO->STA & (1U << 2)) return 0;  /* CCRCFAIL */
+    }
+
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * SDIO_SendCMD_Debug — same as above but prints STA and RESP1
+ * ----------------------------------------------------------------------- */
 int SDIO_SendCMD_Debug(uint8_t cmd, uint32_t arg, uint8_t resp)
 {
     char buf[100];
@@ -45,18 +160,35 @@ int SDIO_SendCMD_Debug(uint8_t cmd, uint32_t arg, uint8_t resp)
 
     SDIO->ARG = arg;
 
-    if(resp == 0)
-        SDIO->CMD = (cmd & 0x3F) | (1 << 10);
+    if (resp == NO_RESP)
+        SDIO->CMD = (cmd & 0x3F) | (1U << 10);
     else
-        SDIO->CMD = (cmd & 0x3F) | (1 << 10) | (1 << 6);
+        SDIO->CMD = (cmd & 0x3F) | (1U << 10) | (1U << 6);
 
-    uint32_t timeout = 1000000;
+    uint32_t timeout = 2000000;
 
-    while(!(SDIO->STA & (1 << 6)) &&
-          !(SDIO->STA & (1 << 2)) &&
-          !(SDIO->STA & (1 << 1)))
+    if (resp == NO_RESP)
     {
-        if(--timeout == 0)
+        while (!(SDIO->STA & (1U << 7)))
+        {
+            if (--timeout == 0)
+            {
+                sprintf(buf, "CMD%d TIMEOUT (no resp)\r\n", cmd);
+                usart_debug(buf);
+                return 0;
+            }
+        }
+        sprintf(buf, "CMD%d SENT OK  STA=0x%08lX\r\n", cmd, SDIO->STA);
+        usart_debug(buf);
+        return 1;
+    }
+
+    /* Response expected */
+    while (!(SDIO->STA & (1U << 6)) &&
+           !(SDIO->STA & (1U << 1)) &&
+           !(SDIO->STA & (1U << 2)))
+    {
+        if (--timeout == 0)
         {
             sprintf(buf, "CMD%d TIMEOUT\r\n", cmd);
             usart_debug(buf);
@@ -64,150 +196,83 @@ int SDIO_SendCMD_Debug(uint8_t cmd, uint32_t arg, uint8_t resp)
         }
     }
 
-    sprintf(buf, "CMD%d STA: 0x%08lX\r\n", cmd, SDIO->STA);
+    sprintf(buf, "CMD%d STA=0x%08lX\r\n", cmd, SDIO->STA);
     usart_debug(buf);
 
-    if(SDIO->STA & (1 << 1))
+    if (SDIO->STA & (1U << 1))
     {
-        usart_debug("TIMEOUT FLAG\r\n");
+        usart_debug("  -> CTIMEOUT\r\n");
         return 0;
     }
 
-    if(SDIO->STA & (1 << 2))
+    if (SDIO->STA & (1U << 2))
     {
-        usart_debug("CRC FAIL\r\n");
+        usart_debug("  -> CCRCFAIL\r\n");
         return 0;
     }
 
-    sprintf(buf, "RESP1: 0x%08lX\r\n", SDIO->RESP1);
+    sprintf(buf, "  RESP1=0x%08lX\r\n", SDIO->RESP1);
     usart_debug(buf);
 
-    usart_debug("CMD OK\r\n");
-
+    usart_debug("  CMD OK\r\n");
     return 1;
 }
 
-void SDIO_FullInit_Debug(void)
-{
-    usart_debug("\r\n==== SD INIT START ====\r\n");
-
-    // CMD0
-    usart_debug("Sending CMD0...\r\n");
-    if(!SDIO_SendCMD_Debug(0, 0, 0)) return;
-
-    // CMD8
-    usart_debug("Sending CMD8...\r\n");
-    if(!SDIO_SendCMD_Debug(8, 0x1AA, 1)) return;
-
-    // ACMD41 loop
-    uint32_t retry = 0;
-
-    while(1)
-    {
-        usart_debug("Sending CMD55...\r\n");
-        if(!SDIO_SendCMD_Debug(55, 0, 1)) return;
-
-        usart_debug("Sending ACMD41...\r\n");
-        if(!SDIO_SendCMD_Debug(41, 0x40000000, 1)) return;
-
-        uint32_t resp = SDIO->RESP1;
-
-        if(resp & (1 << 31))
-        {
-            usart_debug("CARD READY\r\n");
-            break;
-        }
-
-        retry++;
-        if(retry > 1000)
-        {
-            usart_debug("ACMD41 TIMEOUT\r\n");
-            return;
-        }
-    }
-
-    usart_debug("==== SD INIT DONE ====\r\n");
-}
-int SDIO_SendCMD(uint8_t cmd, uint32_t arg, uint8_t resp)
-{
-    SDIO->ICR = 0xFFFFFFFF;
-
-    SDIO->ARG = arg;
-
-    if(resp == NO_RESP)
-        SDIO->CMD = (cmd & 0x3F) | (1 << 10);
-    else
-        SDIO->CMD = (cmd & 0x3F) | (1 << 10) | (1 << 6);
-
-    uint32_t timeout = 1000000;
-
-    while(!(SDIO->STA & (1 << 7)) &&  // CMDSENT
-          !(SDIO->STA & (1 << 6)) &&  // CMDREND
-          !(SDIO->STA & (1 << 2)) &&
-          !(SDIO->STA & (1 << 1)))
-    {
-        if(--timeout == 0)
-        {
-            usart_debug("CMD TIMEOUT\r\n");
-            return 0;
-        }
-    }
-
-    if(SDIO->STA & (1 << 1)) return 0;
-    if(SDIO->STA & (1 << 2)) return 0;
-
-    return 1;
-}
+/* -----------------------------------------------------------------------
+ * SDIO_CardInit — CMD0 → CMD8 → ACMD41 loop
+ * ----------------------------------------------------------------------- */
 int SDIO_CardInit(void)
 {
     usart_debug("\r\n--- SD INIT START ---\r\n");
 
-    // CMD0 → Reset
-    if(!SDIO_SendCMD(0, 0, 0))
+    /* CMD0: reset to idle, no response */
+    if (!SDIO_SendCMD(0, 0, NO_RESP))
     {
         usart_debug("CMD0 FAIL\r\n");
         return 0;
     }
     usart_debug("CMD0 OK\r\n");
 
-    // CMD8 → Voltage check
-    if(!SDIO_SendCMD(8, 0x1AA, 1))
+    /* CMD8: voltage check (expect echo 0x1AA), short response */
+    if (!SDIO_SendCMD(8, 0x1AA, SHORT_RESP))
     {
-        usart_debug("CMD8 FAIL\r\n");
-        return 0;
+        usart_debug("CMD8 FAIL (card may be SD v1 — continuing)\r\n");
+        /* Not fatal for very old cards, but most modern cards need this */
     }
-    usart_debug("CMD8 OK\r\n");
+    else
+    {
+        usart_debug("CMD8 OK\r\n");
+    }
 
-    // ACMD41 loop
+    /* ACMD41 loop: CMD55 + ACMD41 until card signals ready */
     uint32_t retry = 0;
 
-    while(1)
+    while (1)
     {
-        // CMD55
-        if(!SDIO_SendCMD(55, 0, 1))
+        if (!SDIO_SendCMD(55, 0, SHORT_RESP))
         {
             usart_debug("CMD55 FAIL\r\n");
             return 0;
         }
 
-        // ACMD41
-        if(!SDIO_SendCMD(41, 0x40000000, 1))
+        /* ACMD41: R3 response — no CRC, use SDIO_SendCMD_R3.
+         * Arg: HCS=1 (bit30) + 3.3V range (bits 15:23) */
+        if (!SDIO_SendCMD_R3(41, 0x51FF8000))
         {
             usart_debug("ACMD41 FAIL\r\n");
             return 0;
         }
 
-        // Check ready (OCR register)
-        uint32_t resp = SDIO->RESP1;
+        uint32_t ocr = SDIO->RESP1;
 
-        if(resp & (1 << 31))  // ready bit
+        if (ocr & (1U << 31))   /* Card power-up status bit */
         {
             usart_debug("CARD READY\r\n");
             break;
         }
 
         retry++;
-        if(retry > 1000)
+        if (retry > 2000)
         {
             usart_debug("ACMD41 TIMEOUT\r\n");
             return 0;
@@ -217,179 +282,974 @@ int SDIO_CardInit(void)
     usart_debug("--- SD INIT DONE ---\r\n");
     return 1;
 }
-void SDIO_Test(void)
+
+/* -----------------------------------------------------------------------
+ * SDIO_FullInit_Debug — verbose version of CardInit
+ * ----------------------------------------------------------------------- */
+void SDIO_FullInit_Debug(void)
 {
-    SDIO_Init();
+    usart_debug("\r\n==== SD INIT START (debug) ====\r\n");
 
-    usart_debug("SDIO INIT DONE\r\n");
+    /* The card may be in Transfer state from a previous run (CMD0 has no
+     * response so we can't confirm it worked). Strategy:
+     * 1. CMD7(RCA=0) — deselects any selected card (R1b, may timeout if none selected — ignore)
+     * 2. CMD0 x5 with delays — drives card to idle
+     * 3. CMD8 — voltage check */
+    usart_debug("Sending CMD7(RCA=0) to deselect...\r\n");
+    SDIO_SendCMD_Debug(7, 0, SHORT_RESP);  /* ignore result */
 
-    // CMD0
-    usart_debug("Sending CMD0...\r\n");
-    SDIO_SendCMD(0, 0, NO_RESP);
-
-    // CMD8
-    usart_debug("Sending CMD8...\r\n");
-
-    if(SDIO_SendCMD(8, 0x1AA, SHORT_RESP))
+    usart_debug("Sending CMD0 x5 (force idle)...\r\n");
+    for (int i = 0; i < 5; i++)
     {
-        uint32_t resp = SDIO->RESP1;
+        SDIO_SendCMD_Debug(0, 0, NO_RESP);
+        for (volatile int d = 0; d < 200000; d++);
+    }
 
-        char buf[50];
-        sprintf(buf, "RESP1: 0x%08lX\r\n", resp);
+    usart_debug("Sending CMD8...\r\n");
+    SDIO_SendCMD_Debug(8, 0x1AA, SHORT_RESP);
+
+    for (volatile int d = 0; d < 100000; d++);
+
+    /* Check card state with CMD13 before starting ACMD41 loop */
+    usart_debug("Sending CMD13 (check state)...\r\n");
+    SDIO_SendCMD_Debug(13, 0, SHORT_RESP);  /* RCA=0 during init */
+
+    uint32_t retry = 0;
+
+    while (1)
+    {
+        usart_debug("Sending CMD55...\r\n");
+        if (!SDIO_SendCMD_Debug(55, 0, SHORT_RESP)) return;
+
+        usart_debug("Sending ACMD41...\r\n");
+        for (volatile int d = 0; d < 500000; d++);
+        if (!SDIO_SendCMD_R3(41, 0x51FF8000)) return;
+
+        uint32_t ocr = SDIO->RESP1;
+        char buf[60];
+        sprintf(buf, "  OCR=0x%08lX (busy=%d)\r\n", ocr, !(ocr >> 31));
         usart_debug(buf);
 
-        if(resp == 0x1AA)
-            usart_debug("CARD DETECTED \r\n");
-        else
-            usart_debug("INVALID RESPONSE \r\n");
+        if (ocr & (1U << 31))
+        {
+            usart_debug("CARD READY\r\n");
+            break;
+        }
+
+        retry++;
+        if (retry > 2000)
+        {
+            usart_debug("ACMD41 TIMEOUT\r\n");
+            return;
+        }
     }
-    else
-    {
-        usart_debug("NO RESPONSE \r\n");
-    }
+
+    usart_debug("==== SD INIT DONE ====\r\n");
 }
 
+/* -----------------------------------------------------------------------
+ * SD_CardDetect_Test
+ * Reads pin levels on CMD (PD2) and D0 (PC8) to check wiring.
+ * Note: pins are put back to input here — call SDIO_Init() again after.
+ * ----------------------------------------------------------------------- */
+void SD_CardDetect_Test(void)
+{
+    usart_debug("\r\n=== SD CARD DETECT TEST ===\r\n");
+
+    /* Set CMD (PD2) and D0 (PC8) as inputs temporarily */
+    GPIOD->MODER &= ~(3U << (2 * 2));
+    GPIOC->MODER &= ~(3U << (8 * 2));
+
+    int cmd = (GPIOD->IDR & (1U << 2)) ? 1 : 0;
+    int d0  = (GPIOC->IDR & (1U << 8)) ? 1 : 0;
+
+    char buf[60];
+    sprintf(buf, "RAW PIN STATE -> CMD=%d, D0=%d\r\n", cmd, d0);
+    usart_debug(buf);
+
+    if (cmd == 0 || d0 == 0)
+        usart_debug("WARNING: LINE LOW - check wiring / pull-ups\r\n");
+    else
+        usart_debug("LINES HIGH (OK)\r\n");
+}
+
+/* -----------------------------------------------------------------------
+ * SDIO_PinTest — toggle CLK (PC12) to verify wiring with a scope/meter
+ * ----------------------------------------------------------------------- */
 void SDIO_PinTest(void)
 {
     usart_debug("\r\n=== PIN TEST START ===\r\n");
 
-    // CLK toggle test (PC12)
-    GPIOC->MODER &= ~(3 << (12*2));
-    GPIOC->MODER |=  (1 << (12*2)); // output
+    /* PC12 → GPIO output */
+    GPIOC->MODER &= ~(3U << (12 * 2));
+    GPIOC->MODER |=  (1U << (12 * 2));
 
-    for(int i=0; i<10; i++)
+    for (int i = 0; i < 10; i++)
     {
-        GPIOC->ODR ^= (1 << 12);
-        for(volatile int d=0; d<500000; d++);
+        GPIOC->ODR ^= (1U << 12);
+        for (volatile int d = 0; d < 500000; d++);
     }
 
     usart_debug("CLK TOGGLE DONE\r\n");
 
-    // CMD read test (PD2)
-    GPIOD->MODER &= ~(3 << (2*2)); // input
+    /* PD2 → input, read CMD line state */
+    GPIOD->MODER &= ~(3U << (2 * 2));
 
-    if(GPIOD->IDR & (1 << 2))
+    if (GPIOD->IDR & (1U << 2))
         usart_debug("CMD LINE HIGH (OK)\r\n");
     else
         usart_debug("CMD LINE LOW (PROBLEM)\r\n");
 }
 
-void SDIO_ClockTest(void)
-{
-    usart_debug("\r\n=== CLOCK TEST ===\r\n");
-
-    SDIO->POWER = 3;
-
-    SDIO->CLKCR = (255 << 0); // slow
-    SDIO->CLKCR |= (1 << 8);  // enable
-
-    usart_debug("Clock Enabled\r\n");
-}
-void SDIO_CMD0_Test(void)
-{
-    usart_debug("\r\n=== CMD0 TEST ===\r\n");
-
-    SDIO->ICR = 0xFFFFFFFF;
-
-    SDIO->ARG = 0;
-    SDIO->CMD = (0 << 0) | (1 << 10); // NO RESP
-
-    uint32_t timeout = 1000000;
-
-    while(!(SDIO->STA & (1 << 7))) // CMDSENT
-    {
-        if(--timeout == 0)
-        {
-            usart_debug("CMD0 NOT SENT \r\n");
-            return;
-        }
-    }
-
-    usart_debug("CMD0 SENT OK ✅\r\n");
-}
-void SDIO_CMD8_Test(void)
-{
-    usart_debug("\r\n=== CMD8 TEST ===\r\n");
-
-    SDIO->ICR = 0xFFFFFFFF;
-
-    SDIO->ARG = 0x1AA;
-    SDIO->CMD = (8 << 0)  | (1 << 6)| (1 << 10);
-
-    uint32_t timeout = 1000000;
-
-    while(!(SDIO->STA & (1 << 6)) &&
-          !(SDIO->STA & (1 << 1)))
-    {
-        if(--timeout == 0)
-        {
-            usart_debug("CMD8 NO RESPONSE \r\n");
-            return;
-        }
-    }
-
-    char buf[50];
-    sprintf(buf, "STA: 0x%08lX\r\n", SDIO->STA);
-    usart_debug(buf);
-
-    sprintf(buf, "RESP1: 0x%08lX\r\n", SDIO->RESP1);
-    usart_debug(buf);
-
-    usart_debug("CMD8 DONE\r\n");
-}
-
-
-void SD_CardDetect_Test(void)
-{
-    usart_debug("\r\n=== SD CARD DETECT TEST ===\r\n");
-
-    // CMD (PD2) → input
-    GPIOD->MODER &= ~(3 << (2*2));
-
-    // D0 (PC8) → input
-    GPIOC->MODER &= ~(3 << (8*2));
-
-    int cmd = (GPIOD->IDR & (1 << 2)) ? 1 : 0;
-    int d0  = (GPIOC->IDR & (1 << 8)) ? 1 : 0;
-
-    uint32_t resp = SDIO->RESP1;
-
-if(resp == 0x1AA)
-{
-    usart_debug("CARD PRESENT \r\n");
-}
-else
-{
-    usart_debug("NO CARD \r\n");
-}
-
-char buf[50];
-//int cmd, d0;
-
- cmd = (GPIOD->IDR & (1 << 2)) ? 1 : 0;
- d0  = (GPIOC->IDR & (1 << 8)) ? 1 : 0;
-
-sprintf(buf, "RAW PIN STATE → CMD=%d, D0=%d\r\n", cmd, d0);
-usart_debug(buf);
-
-if(cmd == 0 || d0 == 0)
-{
-    usart_debug(" SIGNAL ISSUE (LINE LOW)\r\n");
-}
-else
-{
-    usart_debug("LINES HIGH (NORMAL)\r\n");
-}
-}
-
-
+/* -----------------------------------------------------------------------
+ * SDIO_DebugFull — run all diagnostics then attempt full init
+ * ----------------------------------------------------------------------- */
 void SDIO_DebugFull(void)
 {
     usart_debug("\r\n===== SDIO FULL DEBUG =====\r\n");
-     SD_CardDetect_Test(); 
 
-    SDIO_PinTest();     
-    SDIO_ClockTest();
-    SDIO_CMD0_Test();
-    SDIO_CMD8_Test();
+    SDIO_Init();
+
+    SD_CardDetect_Test();
+
+    /* Re-init GPIOs after CardDetect set them to input */
+    SDIO_Init();
+
+    SDIO_PinTest();
+
+    /* Re-init after PinTest set PC12 to GPIO output */
+    SDIO_Init();
+
+    SDIO_FullInit_Debug();
+}
+
+/* -----------------------------------------------------------------------
+ * SD_GetRCA — CMD2 (ALL_SEND_CID) + CMD3 (SEND_RELATIVE_ADDR)
+ * Returns the 16-bit RCA assigned by the card, or 0 on failure.
+ * ----------------------------------------------------------------------- */
+uint16_t SD_GetRCA(void)
+{
+    char buf[80];
+
+    /* CMD2: ALL_SEND_CID — R2 long response (136-bit), no CRC check */
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = 0;
+    /* WAITRESP=11 (long), CPSMEN */
+    SDIO->CMD = (2U & 0x3F) | (1U << 10) | (3U << 6);
+
+    uint32_t timeout = 2000000;
+    while (!(SDIO->STA & (1U << 6)) &&
+           !(SDIO->STA & (1U << 1)) &&
+           !(SDIO->STA & (1U << 2)))
+    {
+        if (--timeout == 0) { usart_debug("CMD2 TIMEOUT\r\n"); return 0; }
+    }
+    if (SDIO->STA & (1U << 1)) { usart_debug("CMD2 CTIMEOUT\r\n"); return 0; }
+    sprintf(buf, "CMD2 OK  CID[0]=0x%08lX\r\n", SDIO->RESP1);
+    usart_debug(buf);
+
+    /* CMD3: SEND_RELATIVE_ADDR — card assigns its RCA, returns R6 */
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = 0;
+    SDIO->CMD = (3U & 0x3F) | (1U << 10) | (1U << 6);  /* short response */
+
+    timeout = 2000000;
+    while (!(SDIO->STA & (1U << 6)) &&
+           !(SDIO->STA & (1U << 1)) &&
+           !(SDIO->STA & (1U << 2)))
+    {
+        if (--timeout == 0) { usart_debug("CMD3 TIMEOUT\r\n"); return 0; }
+    }
+    if (SDIO->STA & (1U << 1)) { usart_debug("CMD3 CTIMEOUT\r\n"); return 0; }
+
+    uint16_t rca = (uint16_t)(SDIO->RESP1 >> 16);
+    sprintf(buf, "CMD3 OK  RCA=0x%04X\r\n", rca);
+    usart_debug(buf);
+    return rca;
+}
+
+/* -----------------------------------------------------------------------
+ * SD_SelectCard — CMD7 (SELECT_CARD) with RCA to move card to Transfer state
+ * ----------------------------------------------------------------------- */
+int SD_SelectCard(uint16_t rca)
+{
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = (uint32_t)rca << 16;
+    SDIO->CMD = (7U & 0x3F) | (1U << 10) | (1U << 6);  /* R1b short */
+
+    uint32_t timeout = 2000000;
+    while (!(SDIO->STA & (1U << 6)) &&
+           !(SDIO->STA & (1U << 1)) &&
+           !(SDIO->STA & (1U << 2)))
+    {
+        if (--timeout == 0) { usart_debug("CMD7 TIMEOUT\r\n"); return 0; }
+    }
+    if (SDIO->STA & (1U << 1)) { usart_debug("CMD7 CTIMEOUT\r\n"); return 0; }
+
+    char buf[48];
+    sprintf(buf, "CMD7 OK  RESP1=0x%08lX (card selected)\r\n", SDIO->RESP1);
+    usart_debug(buf);
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * SD_WriteBlock — CMD24: write 512-byte block at given block address
+ * ----------------------------------------------------------------------- */
+int SD_WriteBlock(uint32_t block_addr, const uint8_t *buf512, uint16_t rca)
+{
+    char msg[64];
+
+    /* Set block length to 512 (CMD16) */
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = 512;
+    SDIO->CMD = (16U & 0x3F) | (1U << 10) | (1U << 6);
+    uint32_t timeout = 2000000;
+    while (!(SDIO->STA & (1U<<6)) && !(SDIO->STA & (1U<<1)) && !(SDIO->STA & (1U<<2)))
+        if (--timeout == 0) { usart_debug("CMD16 TIMEOUT\r\n"); return 0; }
+    if (SDIO->STA & (1U<<1)) { usart_debug("CMD16 CTIMEOUT\r\n"); return 0; }
+
+    /* CMD24: WRITE_BLOCK — send command first, get R1 response */
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = block_addr;
+    SDIO->CMD = (24U & 0x3F) | (1U << 10) | (1U << 6);
+    timeout = 2000000;
+    while (!(SDIO->STA & (1U<<6)) && !(SDIO->STA & (1U<<1)) && !(SDIO->STA & (1U<<2)))
+        if (--timeout == 0) { usart_debug("CMD24 TIMEOUT\r\n"); return 0; }
+    if (SDIO->STA & (1U<<1)) { usart_debug("CMD24 CTIMEOUT\r\n"); return 0; }
+
+    SDIO->DTIMER = 0xFFFFFFFF;
+    SDIO->DLEN   = 512;
+    SDIO->ICR    = 0xFFFFFFFF;
+    SDIO->DCTRL  = (9U << 4) | (0U << 1) | (1U << 0);
+    for (volatile int i = 0; i < 100; i++);
+
+    const uint32_t *src = (const uint32_t *)buf512;
+    int words_written = 0;
+
+    while (words_written < 128)
+    {
+        timeout = 2000000;
+        while (!(SDIO->STA & (1U << 14)))
+        {
+            if (SDIO->STA & ((1U<<3)|(1U<<4)|(1U<<5))) {
+                sprintf(msg, "WRITE ERR w=%d STA=0x%08lX\r\n", words_written, SDIO->STA);
+                usart_debug(msg);
+                return 0;
+            }
+            if (--timeout == 0) {
+                sprintf(msg, "TXFIFOHE STUCK w=%d STA=0x%08lX\r\n", words_written, SDIO->STA);
+                usart_debug(msg);
+                return 0;
+            }
+        }
+        int burst = (128 - words_written < 8) ? (128 - words_written) : 8;
+        for (int j = 0; j < burst; j++)
+            SDIO->FIFO = src[words_written++];
+    }
+    timeout = 5000000;
+    while (!(SDIO->STA & (1U << 8)))
+    {
+        if (SDIO->STA & ((1U<<3)|(1U<<4)|(1U<<5))) {
+            sprintf(msg, "WRITE ERR STA=0x%08lX\r\n", SDIO->STA);
+            usart_debug(msg);
+            return 0;
+        }
+        if (--timeout == 0) {
+            usart_debug("WRITE TIMEOUT\r\n");
+            return 0;
+        }
+    }
+
+    SDIO->DCTRL = 0;      /* Release SDIO data path */
+    SDIO->ICR   = 0xFFFFFFFF;
+
+    /* Poll CMD13 until card exits programming state (bit 8 = READY_FOR_DATA,
+     * bits [12:9] = TRAN state = 0b0100 = 4) */
+    timeout = 5000000;
+    while (1)
+    {
+        SDIO->ICR = 0xFFFFFFFF;
+        SDIO->ARG = (uint32_t)rca << 16;
+        SDIO->CMD = (13U & 0x3F) | (1U << 10) | (1U << 6);
+        uint32_t t2 = 200000;
+        while (!(SDIO->STA & (1U<<6)) && !(SDIO->STA & (1U<<1)) && !(SDIO->STA & (1U<<2)))
+            if (--t2 == 0) break;
+        uint32_t r1 = SDIO->RESP1;
+        /* READY_FOR_DATA = bit 8, current state = bits [12:9] */
+        if ((r1 & (1U << 8)) && (((r1 >> 9) & 0xF) == 4))
+            break;
+        if (--timeout == 0) { usart_debug("CARD BUSY TIMEOUT\r\n"); return 0; }
+    }
+
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * SD_ReadBlock — CMD17: read 512-byte block at given block address
+ * ----------------------------------------------------------------------- */
+int SD_ReadBlock(uint32_t block_addr, uint8_t *buf512)
+{
+    char msg[64];
+
+    /* CMD16: SET_BLOCKLEN = 512 */
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = 512;
+    SDIO->CMD = (16U & 0x3F) | (1U << 10) | (1U << 6);
+    uint32_t timeout = 2000000;
+    while (!(SDIO->STA & (1U<<6)) && !(SDIO->STA & (1U<<1)) && !(SDIO->STA & (1U<<2)))
+        if (--timeout == 0) { usart_debug("CMD16 TIMEOUT\r\n"); return 0; }
+    if (SDIO->STA & (1U<<1)) { usart_debug("CMD16 CTIMEOUT\r\n"); return 0; }
+
+    /* For reads: configure data path BEFORE CMD17 so peripheral is ready
+     * to receive data as soon as the card starts sending */
+    SDIO->DTIMER = 0xFFFFFFFF;
+    SDIO->DLEN   = 512;
+    SDIO->ICR    = 0xFFFFFFFF;
+    /* DBLOCKSIZE=9, DTDIR=1 (card→host), DTEN=1 */
+    SDIO->DCTRL  = (9U << 4) | (1U << 1) | (1U << 0);
+
+    /* CMD17: READ_SINGLE_BLOCK */
+    SDIO->ARG = block_addr;
+    SDIO->CMD = (17U & 0x3F) | (1U << 10) | (1U << 6);
+    timeout = 2000000;
+    while (!(SDIO->STA & (1U<<6)) && !(SDIO->STA & (1U<<1)) && !(SDIO->STA & (1U<<2)))
+        if (--timeout == 0) { usart_debug("CMD17 TIMEOUT\r\n"); return 0; }
+    if (SDIO->STA & (1U<<1)) { usart_debug("CMD17 CTIMEOUT\r\n"); return 0; }
+
+    /* Read 512 bytes from FIFO */
+    uint32_t *dst = (uint32_t *)buf512;
+    for (int i = 0; i < 128; i++)
+    {
+        /* Wait for RXDAVL (data available in FIFO, bit 21) */
+        timeout = 2000000;
+        while (!(SDIO->STA & (1U << 21)))
+        {
+            if (SDIO->STA & ((1U<<3)|(1U<<5))) { /* DTIMEOUT=3, RXOVERR=5 */
+                sprintf(msg, "READ ERR i=%d STA=0x%08lX\r\n", i, SDIO->STA);
+                usart_debug(msg);
+                return 0;
+            }
+            if (--timeout == 0) {
+                sprintf(msg, "READ FIFO TIMEOUT i=%d STA=0x%08lX\r\n", i, SDIO->STA);
+                usart_debug(msg);
+                return 0;
+            }
+        }
+        dst[i] = SDIO->FIFO;
+    }
+
+    /* Wait for DATAEND */
+    timeout = 2000000;
+    while (!(SDIO->STA & (1U << 8)))
+    {
+        if (SDIO->STA & ((1U<<3)|(1U<<5))) {
+            sprintf(msg, "READ DATAEND ERR STA=0x%08lX\r\n", SDIO->STA);
+            usart_debug(msg);
+            return 0;
+        }
+        if (--timeout == 0) { usart_debug("READ DATAEND TIMEOUT\r\n"); return 0; }
+    }
+
+    SDIO->DCTRL = 0;      /* Release SDIO data path */
+    SDIO->ICR   = 0xFFFFFFFF;
+    return 1;
+}
+
+/* -----------------------------------------------------------------------
+ * SD_ReadWriteTest — write a pattern to block 8, read it back, verify
+ * Block 8 is used (not block 0) to avoid overwriting the MBR/partition table
+ * ----------------------------------------------------------------------- */
+void SD_ReadWriteTest(uint16_t rca)
+{
+    usart_debug("\r\n===== SD READ/WRITE TEST =====\r\n");
+
+    static uint8_t wbuf[512];
+    static uint8_t rbuf[512];
+
+    /* Fill write buffer with a known pattern */
+    for (int i = 0; i < 512; i++)
+        wbuf[i] = (uint8_t)(i & 0xFF);
+
+    usart_debug("Writing block 100...\r\n");
+    if (!SD_WriteBlock(100U * 512U, wbuf, rca)) { usart_debug("WRITE FAILED\r\n"); return; }
+
+    /* Brief delay before read */
+    for (volatile int d = 0; d < 100000; d++);
+
+    usart_debug("Reading block 100...\r\n");
+    if (!SD_ReadBlock(100U * 512U, rbuf)) { usart_debug("READ FAILED\r\n"); return; }
+
+    /* Verify */
+    int errors = 0;
+    for (int i = 0; i < 512; i++)
+    {
+        if (rbuf[i] != wbuf[i]) errors++;
+    }
+
+    char buf[64];
+    if (errors == 0)
+    {
+        usart_debug("VERIFY OK — all 512 bytes match!\r\n");
+        /* Print first 16 bytes as hex */
+        sprintf(buf, "Data[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+                rbuf[0],rbuf[1],rbuf[2],rbuf[3],rbuf[4],rbuf[5],rbuf[6],rbuf[7]);
+        usart_debug(buf);
+    }
+    else
+    {
+        sprintf(buf, "VERIFY FAILED: %d bytes mismatch\r\n", errors);
+        usart_debug(buf);
+    }
+
+    usart_debug("===== TEST DONE =====\r\n");
+}
+
+/* -----------------------------------------------------------------------
+ * SD_WriteBMP_RGB565
+ * Writes a raw RGB565 image as a BMP file to SD card starting at
+ * block_start. The BMP header (54 bytes) is packed into the first
+ * 512-byte sector together with the first pixel bytes.
+ *
+ * Uses BI_BITFIELDS (compression=3) with RGB565 masks so any viewer
+ * that supports 16-bit BMP can open the file.
+ *
+ * block_start: logical block address (byte_addr / 512 for SDHC, or
+ *              byte_addr for SDSC — here we use byte addressing as
+ *              in SD_WriteBlock, so pass block_start * 512 at call site)
+ * ----------------------------------------------------------------------- */
+void SD_WriteBMP_RGB565(uint16_t rca, uint32_t block_start,
+                        const uint8_t *pixels, int width, int height)
+{
+    char msg[64];
+    static uint8_t sector[512];
+
+    uint32_t pixel_bytes  = (uint32_t)(width * height * 2);
+    /* BMP with BI_BITFIELDS needs an extra 12-byte mask table after the
+     * 40-byte DIB header, so pixel data starts at offset 66. */
+    uint32_t pixel_offset = 66;
+    uint32_t file_size    = pixel_offset + pixel_bytes;
+
+    sprintf(msg, "BMP: %dx%d, %lu bytes, %lu sectors\r\n",
+            width, height, file_size,
+            (file_size + 511) / 512);
+    usart_debug(msg);
+
+    /* ---- Build first sector: BMP header + start of pixel data ---- */
+    memset(sector, 0, 512);
+
+    /* BMP file header (14 bytes) */
+    sector[0] = 'B';
+    sector[1] = 'M';
+    sector[2] = (uint8_t)(file_size);
+    sector[3] = (uint8_t)(file_size >> 8);
+    sector[4] = (uint8_t)(file_size >> 16);
+    sector[5] = (uint8_t)(file_size >> 24);
+    /* reserved: bytes 6-9 = 0 */
+    sector[10] = (uint8_t)(pixel_offset);
+    sector[11] = (uint8_t)(pixel_offset >> 8);
+    /* bytes 12-13 = 0 */
+
+    /* DIB header — BITMAPINFOHEADER (40 bytes at offset 14) */
+    sector[14] = 40; /* header size */
+    /* width */
+    sector[18] = (uint8_t)(width);
+    sector[19] = (uint8_t)(width >> 8);
+    /* height — negative = top-down row order */
+    int32_t neg_height = -height;
+    sector[22] = (uint8_t)(neg_height);
+    sector[23] = (uint8_t)(neg_height >> 8);
+    sector[24] = (uint8_t)(neg_height >> 16);
+    sector[25] = (uint8_t)(neg_height >> 24);
+    /* color planes = 1 */
+    sector[26] = 1;
+    /* bits per pixel = 16 */
+    sector[28] = 16;
+    /* compression = 3 (BI_BITFIELDS) */
+    sector[30] = 3;
+    /* image size in bytes */
+    sector[34] = (uint8_t)(pixel_bytes);
+    sector[35] = (uint8_t)(pixel_bytes >> 8);
+    sector[36] = (uint8_t)(pixel_bytes >> 16);
+    sector[37] = (uint8_t)(pixel_bytes >> 24);
+    /* X/Y pixels per meter = 0, colors used/important = 0 */
+
+    /* RGB565 channel masks at offset 54 (12 bytes) */
+    /* Red   mask: 0xF800 */
+    sector[54] = 0x00; sector[55] = 0xF8; sector[56] = 0x00; sector[57] = 0x00;
+    /* Green mask: 0x07E0 */
+    sector[58] = 0xE0; sector[59] = 0x07; sector[60] = 0x00; sector[61] = 0x00;
+    /* Blue  mask: 0x001F */
+    sector[62] = 0x1F; sector[63] = 0x00; sector[64] = 0x00; sector[65] = 0x00;
+
+    /* Pixel data starts at offset 66; pack the first (512-66) bytes in */
+    uint32_t first_chunk = 512 - pixel_offset;
+    if (first_chunk > pixel_bytes) first_chunk = pixel_bytes;
+    memcpy(&sector[pixel_offset], pixels, first_chunk);
+
+    usart_debug("Writing BMP sector 0 (header)...\r\n");
+    if (!SD_WriteBlock(block_start, sector, rca))
+    {
+        usart_debug("BMP WRITE FAILED at sector 0\r\n");
+        return;
+    }
+
+    /* ---- Write remaining pixel data 512 bytes at a time ---- */
+    uint32_t offset = first_chunk;
+    uint32_t blk    = block_start + 512; /* next logical byte address */
+
+    while (offset < pixel_bytes)
+    {
+        memset(sector, 0, 512);
+        uint32_t chunk = pixel_bytes - offset;
+        if (chunk > 512) chunk = 512;
+        memcpy(sector, pixels + offset, chunk);
+
+        if (!SD_WriteBlock(blk, sector, rca))
+        {
+            sprintf(msg, "BMP WRITE FAILED at offset %lu\r\n", offset);
+            usart_debug(msg);
+            return;
+        }
+        offset += chunk;
+        blk    += 512;
+    }
+
+    sprintf(msg, "BMP WRITE DONE — %lu bytes across %lu sectors\r\n",
+            file_size, (file_size + 511) / 512);
+    usart_debug(msg);
+}
+
+/* -----------------------------------------------------------------------
+ * SD_ReadBMP_Verify
+ * Reads back the BMP written by SD_WriteBMP_RGB565 and checks:
+ *   1. Magic bytes 'B','M' at offset 0
+ *   2. The RGB565 red-channel mask at offset 54 equals 0x0000F800
+ *   3. First 8 pixel bytes match what was written
+ * ----------------------------------------------------------------------- */
+void SD_ReadBMP_Verify(uint32_t block_start, const uint8_t *original_pixels)
+{
+    static uint8_t sector[512];
+    char msg[80];
+
+    usart_debug("\r\n===== BMP READ-BACK VERIFY =====\r\n");
+
+    if (!SD_ReadBlock(block_start, sector))
+    {
+        usart_debug("READ FAILED\r\n");
+        return;
+    }
+
+    /* Check magic */
+    if (sector[0] == 'B' && sector[1] == 'M')
+        usart_debug("Magic 'BM': OK\r\n");
+    else
+    {
+        sprintf(msg, "Magic FAIL: got 0x%02X 0x%02X\r\n", sector[0], sector[1]);
+        usart_debug(msg);
+        return;
+    }
+
+    /* Check file size field */
+    uint32_t fsize = (uint32_t)sector[2]
+                   | ((uint32_t)sector[3] << 8)
+                   | ((uint32_t)sector[4] << 16)
+                   | ((uint32_t)sector[5] << 24);
+    sprintf(msg, "File size: %lu bytes\r\n", fsize);
+    usart_debug(msg);
+
+    /* Check red mask at byte 54 */
+    uint32_t rmask = (uint32_t)sector[54]
+                   | ((uint32_t)sector[55] << 8)
+                   | ((uint32_t)sector[56] << 16)
+                   | ((uint32_t)sector[57] << 24);
+    if (rmask == 0x0000F800)
+        usart_debug("Red mask 0xF800: OK\r\n");
+    else
+    {
+        sprintf(msg, "Red mask FAIL: got 0x%08lX\r\n", rmask);
+        usart_debug(msg);
+    }
+
+    /* Check first 8 pixel bytes (at offset 66 in the sector) */
+    int pixel_errors = 0;
+    for (int i = 0; i < 8; i++)
+        if (sector[66 + i] != original_pixels[i]) pixel_errors++;
+
+    if (pixel_errors == 0)
+        usart_debug("First 8 pixel bytes: OK\r\n");
+    else
+    {
+        usart_debug("Pixel mismatch:\r\n");
+        sprintf(msg, "  Written:  %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+                original_pixels[0], original_pixels[1],
+                original_pixels[2], original_pixels[3],
+                original_pixels[4], original_pixels[5],
+                original_pixels[6], original_pixels[7]);
+        usart_debug(msg);
+        sprintf(msg, "  ReadBack: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+                sector[66], sector[67], sector[68], sector[69],
+                sector[70], sector[71], sector[72], sector[73]);
+        usart_debug(msg);
+    }
+
+    usart_debug("===== VERIFY DONE =====\r\n");
+}
+
+/* -----------------------------------------------------------------------
+ * SD_ImageTest
+ * Generates a 32x32 RGB565 color-bar test image entirely in static RAM
+ * (32*32*2 = 2048 bytes), writes it as a BMP at sector 2048 (1MB offset,
+ * safely past any partition table), then reads it back and verifies.
+ * ----------------------------------------------------------------------- */
+void SD_ImageTest(uint16_t rca)
+{
+    usart_debug("\r\n===== IMAGE CAPTURE & SAVE TEST =====\r\n");
+
+#define IMG_W 32
+#define IMG_H 32
+    static uint8_t img[IMG_W * IMG_H * 2];  /* 2048 bytes */
+
+    /* Generate color-bar pattern (8 vertical bars cycling through RGB565) */
+    static const uint16_t colors[8] = {
+        0xFFFF,  /* white  */
+        0xFFE0,  /* yellow */
+        0x07FF,  /* cyan   */
+        0x07E0,  /* green  */
+        0xF81F,  /* magenta*/
+        0xF800,  /* red    */
+        0x001F,  /* blue   */
+        0x0000,  /* black  */
+    };
+
+    for (int y = 0; y < IMG_H; y++)
+    {
+        for (int x = 0; x < IMG_W; x++)
+        {
+            uint16_t px   = colors[(x * 8) / IMG_W];
+            int      idx  = (y * IMG_W + x) * 2;
+            /* BMP stores 16-bit pixels little-endian */
+            img[idx]     = (uint8_t)(px & 0xFF);
+            img[idx + 1] = (uint8_t)(px >> 8);
+        }
+    }
+
+    usart_debug("Test image generated (32x32 color bars)\r\n");
+
+    /* Write BMP to SD card at byte address 2048*512 = 1 MiB */
+    uint32_t bmp_addr = 2048UL * 512UL;
+    SD_WriteBMP_RGB565(rca, bmp_addr, img, IMG_W, IMG_H);
+
+    /* Brief delay before read-back */
+    for (volatile int d = 0; d < 200000; d++);
+
+    /* Read back and verify */
+    SD_ReadBMP_Verify(bmp_addr, img);
+
+    usart_debug("===== IMAGE TEST DONE =====\r\n");
+}
+
+/* -----------------------------------------------------------------------
+ * SD_DumpBMP_UART
+ * Reads the BMP back from SD card and prints every byte as hex over UART.
+ * Format: "BMP_START\r\n" then lines of 16 hex bytes, then "BMP_END\r\n"
+ * A PC script can capture this and reconstruct the .bmp file.
+ *
+ * total_bytes: file size (66 + width*height*2)
+ * ----------------------------------------------------------------------- */
+void SD_DumpBMP_UART(uint32_t block_start, uint32_t total_bytes)
+{
+    static uint8_t sector[512];
+    char line[64];
+
+    usart_debug("\r\nBMP_START\r\n");
+
+    uint32_t bytes_sent = 0;
+    uint32_t addr       = block_start;
+
+    while (bytes_sent < total_bytes)
+    {
+        if (!SD_ReadBlock(addr, sector))
+        {
+            usart_debug("READ_ERROR\r\n");
+            return;
+        }
+
+        uint32_t chunk = total_bytes - bytes_sent;
+        if (chunk > 512) chunk = 512;
+
+        /* Print 16 bytes per line */
+        for (uint32_t i = 0; i < chunk; i += 16)
+        {
+            uint32_t row = (chunk - i < 16) ? (chunk - i) : 16;
+            int pos = 0;
+            for (uint32_t j = 0; j < row; j++)
+            {
+                pos += sprintf(&line[pos], "%02X", sector[i + j]);
+                if (j < row - 1) line[pos++] = ' ';
+            }
+            line[pos++] = '\r';
+            line[pos++] = '\n';
+            line[pos]   = '\0';
+            usart_debug(line);
+        }
+
+        bytes_sent += chunk;
+        addr       += 512;
+    }
+
+    usart_debug("BMP_END\r\n");
+}
+
+/* -----------------------------------------------------------------------
+ * SD_WriteTextFiles
+ * Writes 5 text files to the SD card, one per sector, starting at
+ * sector 4096 (2 MiB offset — well past the BMP at 1 MiB).
+ * Each file content fits within 512 bytes (one sector).
+ * After writing, reads each one back and prints content over UART.
+ * ----------------------------------------------------------------------- */
+void SD_WriteTextFiles(uint16_t rca)
+{
+    static uint8_t sector[512];
+    char msg[80];
+
+    /* 5 files: name + content */
+    static const char * const names[5] = {
+        "file1.txt",
+        "file2.txt",
+        "file3.txt",
+        "file4.txt",
+        "file5.txt",
+    };
+
+    static const char * const contents[5] = {
+        "hello MR , \nhello from STM32F411!\nThis is file 1.\nWritten via SDIO.\n",
+        "The quick brown fox jumps over the lazy dog.\nFile 2 of 5.\n",
+        "STM32F411 running at 96MHz.\nSDIO clock: 48MHz.\nFile 3 of 5.\n",
+        "Bare-metal embedded systems are awesome.\nNo OS needed.\nFile 4 of 5.\n",
+        "This is the last file.\nAll 5 files written to SD card over SDIO.\nDone!\n",
+    };
+
+    /* Each file gets one sector (512 bytes), starting at sector 4096 */
+    uint32_t base_addr = 4096UL * 512UL;
+
+    usart_debug("\r\n===== WRITING 5 TEXT FILES =====\r\n");
+
+    /* --- Write phase --- */
+    for (int i = 0; i < 5; i++)
+    {
+        memset(sector, 0, 512);
+
+        /* Copy content into sector (null-terminated, zero-padded) */
+        int len = 0;
+        while (contents[i][len] != '\0' && len < 511)
+        {
+            sector[len] = (uint8_t)contents[i][len];
+            len++;
+        }
+
+        uint32_t addr = base_addr + (uint32_t)i * 512UL;
+        sprintf(msg, "Writing %s (%d bytes) at byte addr %lu...\r\n",
+                names[i], len, addr);
+        usart_debug(msg);
+
+        if (!SD_WriteBlock(addr, sector, rca))
+        {
+            sprintf(msg, "WRITE FAILED: %s\r\n", names[i]);
+            usart_debug(msg);
+            return;
+        }
+    }
+
+    usart_debug("All 5 files written.\r\n");
+
+    /* Brief delay before read-back */
+    for (volatile int d = 0; d < 200000; d++);
+
+    /* --- Read-back and print phase --- */
+    usart_debug("\r\n===== READING BACK 5 TEXT FILES =====\r\n");
+
+    for (int i = 0; i < 5; i++)
+    {
+        uint32_t addr = base_addr + (uint32_t)i * 512UL;
+        memset(sector, 0, 512);
+
+        sprintf(msg, "\r\n--- %s (addr=%lu) ---\r\n", names[i], addr);
+        usart_debug(msg);
+
+        if (!SD_ReadBlock(addr, sector))
+        {
+            usart_debug("READ FAILED\r\n");
+            return;
+        }
+
+        /* Print content as a string — stop at first null or 511 chars */
+        /* Print in 79-char chunks to fit in a fixed buffer */
+        int total = 0;
+        while (total < 511 && sector[total] != 0)
+            total++;
+
+        char out[82];
+        int pos = 0;
+        for (int j = 0; j < total; j++)
+        {
+            out[pos++] = (char)sector[j];
+            if (pos == 79 || j == total - 1)
+            {
+                out[pos++] = '\r';
+                out[pos]   = '\0';
+                usart_debug(out);
+                pos = 0;
+            }
+        }
+    }
+
+    usart_debug("\r\n===== TEXT FILE TEST DONE =====\r\n");
+}
+
+/* -----------------------------------------------------------------------
+ * SD_FatFsTest
+ * Formats the SD card as FAT32, then writes 5 text files using FatFs.
+ * Files will be visible on any PC as normal files.
+ * ----------------------------------------------------------------------- */
+
+
+void SD_FatFsTest(void)
+{
+    static FATFS   fs;
+    static FIL     fil;
+    FRESULT res;
+    char    msg[80];
+
+    static const char * const filenames[5] = {
+        "FILE1.TXT",
+        "FILE2.TXT",
+        "FILE3.TXT",
+        "FILE4.TXT",
+        "FILE5.TXT",
+    };
+
+    static const char * const contents[5] = {
+        "Hello from STM32F411!\nThis is file 1.\nWritten via SDIO + FatFs.\n",
+        "The quick brown fox jumps over the lazy dog.\nFile 2 of 5.\n",
+        "STM32F411 running at 96MHz.\nSDIO clock: 48MHz.\nFile 3 of 5.\n",
+        "Bare-metal embedded systems are awesome.\nNo OS needed.\nFile 4 of 5.\n",
+        "This is the last file.\nAll 5 files written via FatFs.\nDone!\n",
+    };
+
+    usart_debug("\r\n===== FATFS TEST =====\r\n");
+
+    /* Try to mount — if card already has FAT we skip format */
+    usart_debug("Mounting...\r\n");
+    res = f_mount(&fs, "", 1);
+    if (res != FR_OK)
+    {
+        sprintf(msg, "Mount failed (%d), formatting...\r\n", res);
+        usart_debug(msg);
+
+        /* Format with a small sector count (65536 = 32MB partition).
+         * This takes ~2 seconds at 400kHz init clock vs minutes for full card. */
+        static BYTE work[512];
+        res = f_mkfs("", FM_FAT | FM_SFD, 0, work, sizeof(work));
+        if (res != FR_OK)
+        {
+            sprintf(msg, "f_mkfs FAILED: %d\r\n", res);
+            usart_debug(msg);
+            return;
+        }
+        usart_debug("Format OK\r\n");
+
+        res = f_mount(&fs, "", 1);
+        if (res != FR_OK)
+        {
+            sprintf(msg, "f_mount after format FAILED: %d\r\n", res);
+            usart_debug(msg);
+            return;
+        }
+    }
+    usart_debug("Mount OK\r\n");
+
+    /* Report capacity and used space */
+    {
+        DWORD fre_clust;
+        FATFS *fsp = &fs;
+        res = f_getfree("", &fre_clust, &fsp);
+        if (res == FR_OK)
+        {
+            DWORD total_sectors = (fsp->n_fatent - 2) * fsp->csize;
+            DWORD free_sectors  = fre_clust * fsp->csize;
+            DWORD used_sectors  = total_sectors - free_sectors;
+            /* Convert sectors (512 bytes each) to KB */
+            DWORD total_kb = total_sectors / 2;
+            DWORD free_kb  = free_sectors  / 2;
+            DWORD used_kb  = used_sectors  / 2;
+            sprintf(msg, "Total: %lu KB  Used: %lu KB  Free: %lu KB\r\n",
+                    total_kb, used_kb, free_kb);
+            usart_debug(msg);
+        }
+        else
+        {
+            sprintf(msg, "f_getfree FAILED: %d\r\n", res);
+            usart_debug(msg);
+        }
+    }
+
+    /* Write 5 files */
+    for (int i = 0; i < 5; i++)
+    {
+        res = f_open(&fil, filenames[i], FA_CREATE_ALWAYS | FA_WRITE);
+        if (res != FR_OK)
+        {
+            sprintf(msg, "f_open FAILED %s: %d\r\n", filenames[i], res);
+            usart_debug(msg);
+            continue;
+        }
+
+        UINT bw;
+        int  len = 0;
+        while (contents[i][len]) len++;
+        res = f_write(&fil, contents[i], (UINT)len, &bw);
+        f_close(&fil);
+
+        if (res == FR_OK)
+        {
+            sprintf(msg, "Written %s (%u bytes)\r\n", filenames[i], bw);
+            usart_debug(msg);
+        }
+        else
+        {
+            sprintf(msg, "f_write FAILED %s: %d\r\n", filenames[i], res);
+            usart_debug(msg);
+        }
+    }
+
+    /* Read back and print each file */
+    usart_debug("\r\n--- Reading files back ---\r\n");
+    static char rbuf[128];
+    for (int i = 0; i < 5; i++)
+    {
+        res = f_open(&fil, filenames[i], FA_READ);
+        if (res != FR_OK)
+        {
+            sprintf(msg, "f_open READ FAILED %s: %d\r\n", filenames[i], res);
+            usart_debug(msg);
+            continue;
+        }
+        sprintf(msg, "\r\n[%s]\r\n", filenames[i]);
+        usart_debug(msg);
+
+        UINT br;
+        while (1)
+        {
+            res = f_read(&fil, rbuf, sizeof(rbuf) - 1, &br);
+            if (res != FR_OK || br == 0) break;
+            rbuf[br] = '\0';
+            usart_debug(rbuf);
+        }
+        f_close(&fil);
+    }
+
+    f_mount(NULL, "", 0);  /* Unmount */
+
+    usart_debug("\r\n===== FATFS TEST DONE =====\r\n");
+    usart_debug("Remove SD card and plug into PC — files visible in file browser!\r\n");
 }

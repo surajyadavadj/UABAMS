@@ -46,6 +46,7 @@
 #include "clock_config.h"
 #include "delay.h"
 #include "health.h"
+#include "sdio.h"
 #include "boot_info.h"
 #include "accelerometer_health.h"
 #include "ethernet_health.h"
@@ -519,6 +520,35 @@ int main(void)
     USART2_Init();
     print_boot_info("DATA LOGGER UNIT");  /* From boot_info.h */
     usart_debug("SYSTEM INITIALIZATION...\r\n");
+
+
+    //------------------------------
+  //  for (volatile int i = 0; i < 32000000; i++);
+    SDIO_Init();
+    SD_CardDetect_Test();
+    SDIO_Init();
+    SDIO_PinTest();
+   SDIO_Init();
+    SDIO_FullInit_Debug();
+
+    uint16_t rca = SD_GetRCA();
+    if (rca == 0) { usart_debug("RCA FAILED\r\n"); while(1); }
+
+    if (!SD_SelectCard(rca)) { usart_debug("SELECT FAILED\r\n"); while(1); }
+
+    g_sd_rca = rca;
+
+    SDIO->ICR = 0xFFFFFFFF;
+    SDIO->ARG = 0;
+    SDIO->CMD = (59U & 0x3F) | (1U << 10) | (1U << 6);
+
+    for (volatile int tt = 0; tt < 2000000; tt++)
+        if (SDIO->STA & ((1U<<6)|(1U<<1)|(1U<<2))) break;
+
+    usart_debug("CMD59 done\r\n");
+
+    SD_FatFsTest();
+    //------------------------------
 
     spi1_init();    /* ADXL345 x2 on SPI1 */
     

@@ -1,6 +1,6 @@
 PROJECT_ROOT  := ../..
 FREERTOS_ROOT := $(PROJECT_ROOT)/src/freertos
-
+FATFS_OBJ = $(wildcard ../../src/fatfs/obj/*.o)
 # Clock
 # 96: PLL on HSI — full performance, correct USB clock (48 MHz)
 # 16: HSI direct — no PLL. Override: make -C src/gps_storage CPU_CLOCK_MHZ=16
@@ -13,7 +13,8 @@ INCLUDES = \
     -I$(PROJECT_ROOT)/include \
     -I$(PROJECT_ROOT)/include/freertos \
     -I$(PROJECT_ROOT)/src/freertos/portable/GCC/ARM_CM4F \
-    -I$(PROJECT_ROOT)/src/common
+    -I$(PROJECT_ROOT)/src/common \
+	-I$(PROJECT_ROOT)/src/fatfs
 
 # Inherit CFLAGS from root Makefile (includes FPU flags); add clock define.
 CFLAGS_LOCAL = $(CFLAGS) -DCPU_CLOCK_MHZ=$(CPU_CLOCK_MHZ)
@@ -104,7 +105,8 @@ $(FREERTOS_OBJDIR)/heap_4.o: $(FREERTOS_ROOT)/portable/MemMang/heap_4.c | $(FREE
 
 # ── Link ───────────────────────────────────────────────────────────────────────
 $(TARGET): $(OBJ) $(LOCAL_OBJ) $(DELAY_OBJ) $(FREERTOS_OBJ)
-	$(CC) $(CFLAGS_LOCAL) $^ $(COMMON_OBJ) $(LDFLAGS) -lm -lgcc -lnosys -o $@
+	$(CC) -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
+	$^ $(COMMON_OBJ) $(FATFS_OBJ) $(LDFLAGS) -lm -lgcc -lnosys -o $@
 
 $(BIN): $(TARGET)
 	$(OBJCOPY) -O binary $< $@
